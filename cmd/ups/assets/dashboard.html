@@ -64,6 +64,12 @@
   .cfg-row button:hover{opacity:.92}
   .cfg-msg{font-size:12px;color:var(--green)}
   .cfg-msg.err{color:var(--red)}
+  .prot{display:flex;align-items:center;gap:8px;background:var(--bg);border:1px solid var(--bd);
+    border-radius:8px;padding:9px 12px;font-size:13px;margin-top:10px}
+  .prot-dot{width:9px;height:9px;border-radius:50%;background:#9aa3b2;flex:none}
+  .prot-dot.on{background:var(--green)}
+  .prot-dot.off{background:#9aa3b2}
+  .prot b{font-weight:650}
   footer{color:var(--tx2);font-size:12px;text-align:center;margin-top:18px}
 </style>
 </head>
@@ -106,7 +112,12 @@
     <div class="panel">
       <h3>电芯电压 (4S)<span class="legend" id="deltaTxt"></span></h3>
       <div class="cells" id="cells"></div>
-      <h3 style="margin-top:14px">事件日志</h3>
+      <h3 style="margin-top:16px">低电量自动保护</h3>
+      <div class="prot" id="protBox">
+        <span class="prot-dot" id="protDot"></span>
+        <span id="protTxt">等待数据…</span>
+      </div>
+      <h3 style="margin-top:16px">事件日志</h3>
       <div class="events" id="events"><div>等待数据…</div></div>
     </div>
   </div>
@@ -323,6 +334,18 @@ function updateConfigUI(d){
   const bb = document.getElementById('cfgBadge');
   bb.textContent = en ? ('启用 · <'+low+'% '+actionLabel(act)+')') : '已禁用';
   bb.className = 'badge'+(en?' g':'');
+
+  // 事件日志上方的保护状态条
+  const box = document.getElementById('protBox');
+  const dot = document.getElementById('protDot');
+  const txt = document.getElementById('protTxt');
+  if(en){
+    dot.className = 'prot-dot on';
+    txt.innerHTML = '电量低于 <b>'+low+'%</b> 时执行 <b>'+actionLabel(act)+'</b>';
+  } else {
+    dot.className = 'prot-dot off';
+    txt.innerHTML = '保护已禁用（电量低于 <b>'+low+'%</b> 时执行 <b>'+actionLabel(act)+'</b>）';
+  }
 }
 
 async function loadConfig(){
