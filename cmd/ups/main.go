@@ -79,7 +79,14 @@ var (
 	fQuiet    = flag.Bool("q", false, "静默模式，不打印表头")
 
 	fNoBrowser = flag.Bool("no-browser", false, "Web 模式下不自动打开浏览器")
+
+	// 低电量自动保护
+	fLow    = flag.Int("low", 0, "电量低于此百分比时触发电源动作（0=关闭，范围 1-100）")
+	fAction = flag.String("action", "shutdown", "低电量动作: shutdown(关机)/sleep(睡眠)/hibernate(休眠)")
 )
+
+// gLowBattery 低电量保护状态机，由 main() 依据命令行参数初始化。
+var gLowBattery *lowBatteryGuard
 
 func main() {
 	flag.Usage = func() {
@@ -90,9 +97,24 @@ func main() {
 			"  %s                 终端实时面板\n"+
 			"  %s -once -json     读取一次并以 JSON 输出\n"+
 			"  %s -web :8080      启动 Web 仪表盘\n"+
-			"  %s -csv ups.csv    实时面板并记录 CSV\n", os.Args[0], os.Args[0], os.Args[0], os.Args[0])
+			"  %s -csv ups.csv    实时面板并记录 CSV\n"+
+			"  %s -low 20 -action shutdown  电量低于 20%% 时自动关机\n", os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0])
 	}
 	flag.Parse()
+
+	if *fLow < 0 || *fLow > 100 {
+		fmt.Fprintf(os.Stderr, "错误: -low 必须介于 0–100 之间\n")
+		os.Exit(2)
+	}
+	if *fLow > 0 {
+		switch *fAction {
+		case "shutdown", "sleep", "hibernate":
+		default:
+			fmt.Fprintf(os.Stderr, "错误: -action 必须是 shutdown / sleep / hibernate 之一\n")
+			os.Exit(2)
+		}
+	}
+	gLowBattery = newLowBatteryGuard(*fLow, *fAction)
 
 	initConsole()
 
@@ -374,6 +396,19 @@ func runConsole() {
 				fmt.Sprintf("%.1f", s.CellDelta()), fmt.Sprintf("%d", rt),
 			})
 			cw.Flush()
+		}
+
+		// 低电量自动保护：电池供电且电量持续低于阈值时执行关机/睡眠/休眠
+		if gLowBattery != nil && gLowBattery.enabled {
+			if fire, msg := gLowBattery.feed(s); fire {
+				events = append(events, fmt.Sprintf("%s %s", time.Now().Format("15:04:05"), msg))
+				if cw != nil {
+					cw.Flush()
+				}
+				render(dev, s, frames, fps, events)
+				_ = powerAction(*fAction)
+				return
+			}
 		}
 
 		if *fJSON {

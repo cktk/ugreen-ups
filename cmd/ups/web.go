@@ -143,6 +143,14 @@ func (m *monitor) readOnce() {
 	if len(m.history) > 1800 { // 约 30 分钟 @1Hz
 		m.history = m.history[len(m.history)-1800:]
 	}
+
+	// 低电量自动保护：电池供电且电量持续低于阈值时执行关机/睡眠/休眠
+	if gLowBattery != nil && gLowBattery.enabled {
+		if fire, msg := gLowBattery.feed(s); fire {
+			m.addEvent(msg)
+			_ = powerAction(gLowBattery.action)
+		}
+	}
 }
 
 func (m *monitor) addEvent(msg string) {
