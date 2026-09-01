@@ -2,6 +2,9 @@
 *.exe
 ups-monitor
 
+# Runtime config (user-editable low-battery settings, not source-controlled)
+ups-monitor.json
+
 # Go test / coverage output
 *.test
 *.out

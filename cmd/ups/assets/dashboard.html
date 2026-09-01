@@ -54,6 +54,16 @@
   .events div:last-child{border:0}
   .err{background:rgba(220,38,38,.08);border:1px solid rgba(220,38,38,.25);
     color:var(--red);padding:10px 14px;border-radius:10px;margin-bottom:14px;font-size:13px}
+  .cfg-row{display:flex;flex-wrap:wrap;align-items:center;gap:14px;font-size:13px;margin-top:4px}
+  .cfg-field{display:inline-flex;align-items:center;gap:6px}
+  .cfg-row input[type=number]{width:64px;padding:5px 8px;border:1px solid var(--bd);
+    border-radius:8px;font-size:13px;font-variant-numeric:tabular-nums}
+  .cfg-row select{padding:5px 8px;border:1px solid var(--bd);border-radius:8px;font-size:13px;background:#fff}
+  .cfg-row button{padding:6px 16px;border:0;border-radius:8px;background:var(--blue);
+    color:#fff;font-size:13px;font-weight:600;cursor:pointer}
+  .cfg-row button:hover{opacity:.92}
+  .cfg-msg{font-size:12px;color:var(--green)}
+  .cfg-msg.err{color:var(--red)}
   footer{color:var(--tx2);font-size:12px;text-align:center;margin-top:18px}
 </style>
 </head>
@@ -99,6 +109,25 @@
       <h3 style="margin-top:14px">事件日志</h3>
       <div class="events" id="events"><div>等待数据…</div></div>
     </div>
+  </div>
+
+  <div class="panel" id="cfgPanel">
+    <h3>低电量自动保护 <span class="badge" id="cfgBadge">—</span></h3>
+    <div class="cfg-row">
+      <label><input type="checkbox" id="cfgEn"> 启用保护</label>
+      <span class="cfg-field">电量低于 <input type="number" id="cfgLow" min="1" max="100"> %</span>
+      <span class="cfg-field">动作
+        <select id="cfgAction">
+          <option value="shutdown">关机</option>
+          <option value="sleep">睡眠</option>
+          <option value="hibernate">休眠</option>
+          <option value="none">仅提示(不执行)</option>
+        </select>
+      </span>
+      <button id="cfgSave">保存</button>
+      <span id="cfgMsg" class="cfg-msg"></span>
+    </div>
+    <div class="s" id="cfgPath" style="margin-top:8px"></div>
   </div>
 
   <footer>数据每秒刷新 · 直接读取 USB HID，无需驱动 · Ctrl+C 停止服务端</footer>
@@ -203,6 +232,7 @@ function render(d){
   }
 
   draw();
+  updateConfigUI(d);
 }
 
 function setupCanvas(id){
@@ -285,7 +315,47 @@ async function prime(){
   draw();
 }
 
+function actionLabel(a){ return {shutdown:'关机',sleep:'睡眠',hibernate:'休眠',none:'仅提示'}[a] || a; }
+
+function updateConfigUI(d){
+  if(!d.config) return;
+  const en = d.config.enabled, low = d.config.low, act = d.config.action;
+  const bb = document.getElementById('cfgBadge');
+  bb.textContent = en ? ('启用 · <'+low+'% '+actionLabel(act)+')') : '已禁用';
+  bb.className = 'badge'+(en?' g':'');
+}
+
+async function loadConfig(){
+  try{
+    const r = await fetch('/api/config',{cache:'no-store'});
+    const c = await r.json();
+    document.getElementById('cfgEn').checked = c.enabled;
+    document.getElementById('cfgLow').value = c.low || '';
+    if(c.action) document.getElementById('cfgAction').value = c.action;
+    document.getElementById('cfgPath').textContent = '配置文件: ' + (c.path||'');
+  }catch(e){}
+}
+
+document.getElementById('cfgSave').addEventListener('click', async ()=>{
+  const msg = document.getElementById('cfgMsg');
+  msg.className = 'cfg-msg'; msg.textContent = '';
+  const low = parseInt(document.getElementById('cfgLow').value, 10);
+  const action = document.getElementById('cfgAction').value;
+  const en = document.getElementById('cfgEn').checked;
+  const payload = { low: en ? (isNaN(low)?0:low) : 0, action };
+  try{
+    const r = await fetch('/api/config',{method:'POST',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+    if(!r.ok){ const e = await r.json().catch(()=>({error:r.statusText}));
+      msg.className='cfg-msg err'; msg.textContent='保存失败: '+(e.error||r.status); return; }
+    const c = await r.json();
+    msg.textContent = '已保存：电量低于 '+c.low+'% 时 '+actionLabel(c.action);
+    loadConfig();
+  }catch(e){ msg.className='cfg-msg err'; msg.textContent='请求失败: '+e; }
+});
+
 window.addEventListener('resize', draw);
+loadConfig();
 prime();
 tick();
 setInterval(tick, 1000);

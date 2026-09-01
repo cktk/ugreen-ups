@@ -188,6 +188,7 @@ func runWeb(addr string) {
 	})
 	mux.HandleFunc("/api/status", m.handleStatus)
 	mux.HandleFunc("/api/history", m.handleHistory)
+	mux.HandleFunc("/api/config", m.handleConfig)
 
 	addr = normalizeAddr(addr)
 	ln, err := net.Listen("tcp", addr)
@@ -253,12 +254,13 @@ func (m *monitor) handleStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 
 	type payload struct {
-		Device   deviceInfo  `json:"device"`
-		Sample   *sampleJSON `json:"sample"`
-		Frames   int         `json:"frames"`
-		Events   []string    `json:"events"`
-		Error    string      `json:"error,omitempty"`
-		ServerAt string      `json:"server_time"`
+		Device   deviceInfo            `json:"device"`
+		Sample   *sampleJSON           `json:"sample"`
+		Frames   int                   `json:"frames"`
+		Events   []string              `json:"events"`
+		Error    string                `json:"error,omitempty"`
+		ServerAt string                `json:"server_time"`
+		Config   map[string]interface{} `json:"config"`
 	}
 	p := payload{
 		Device:   m.info,
@@ -267,6 +269,8 @@ func (m *monitor) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Error:    m.lastErr,
 		ServerAt: time.Now().Format(time.RFC3339),
 	}
+	en, low, act := gLowBattery.Snapshot()
+	p.Config = map[string]interface{}{"enabled": en, "low": low, "action": act}
 	if m.latest != nil {
 		j := newSampleJSON(m.latest, false)
 		p.Sample = &j
@@ -287,4 +291,60 @@ func (m *monitor) handleHistory(w http.ResponseWriter, r *http.Request) {
 		out = []historyPoint{}
 	}
 	json.NewEncoder(w).Encode(out)
+}
+
+// handleConfig 提供低电量保护的读取(GET)与修改(POST/PUT)。修改即时生效并持久化。
+func (m *monitor) handleConfig(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	defer r.Body.Close()
+
+	switch r.Method {
+	case http.MethodGet:
+		en, low, act := gLowBattery.Snapshot()
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"enabled": en,
+			"low":     low,
+			"action":  act,
+			"actions": []string{"shutdown", "sleep", "hibernate", "none"},
+			"path":    configPath,
+		})
+	case http.MethodPost, http.MethodPut:
+		var req struct {
+			Low    int    `json:"low"`
+			Action string `json:"action"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "无效的 JSON"})
+			return
+		}
+		if req.Low < 0 || req.Low > 100 {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "low 必须介于 0–100"})
+			return
+		}
+		switch req.Action {
+		case "shutdown", "sleep", "hibernate", "none":
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "未知 action"})
+			return
+		}
+		en := req.Low > 0
+		gLowBattery.Configure(en, req.Low, req.Action)
+		if err := saveConfig(AppConfig{Low: req.Low, Action: req.Action}); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "保存配置失败: " + err.Error()})
+			return
+		}
+		en2, low2, act2 := gLowBattery.Snapshot()
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"enabled": en2,
+			"low":     low2,
+			"action":  act2,
+		})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
 }

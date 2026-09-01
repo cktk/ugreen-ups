@@ -7,13 +7,16 @@
 package main
 
 import (
+	"bufio"
 	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -85,8 +88,11 @@ var (
 	fAction = flag.String("action", "shutdown", "低电量动作: shutdown(关机)/sleep(睡眠)/hibernate(休眠)")
 )
 
-// gLowBattery 低电量保护状态机，由 main() 依据命令行参数初始化。
+// gLowBattery 低电量保护状态机，由 main() 依据命令行参数或配置文件初始化。
 var gLowBattery *lowBatteryGuard
+
+// consolePaused 在终端配置菜单期间为 1，暂停面板刷新与保护评估。
+var consolePaused int32
 
 func main() {
 	flag.Usage = func() {
@@ -106,15 +112,27 @@ func main() {
 		fmt.Fprintf(os.Stderr, "错误: -low 必须介于 0–100 之间\n")
 		os.Exit(2)
 	}
-	if *fLow > 0 {
-		switch *fAction {
-		case "shutdown", "sleep", "hibernate":
+
+	// 低电量保护配置：启动参数优先；否则读取已保存的配置文件（ups-monitor.json）。
+	set := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	low, action := *fLow, *fAction
+	if set["low"] || set["action"] {
+		switch action {
+		case "shutdown", "sleep", "hibernate", "none":
 		default:
-			fmt.Fprintf(os.Stderr, "错误: -action 必须是 shutdown / sleep / hibernate 之一\n")
+			fmt.Fprintf(os.Stderr, "错误: -action 必须是 shutdown / sleep / hibernate / none 之一\n")
 			os.Exit(2)
 		}
+		gLowBattery = newLowBatteryGuard(low, action)
+		if err := saveConfig(AppConfig{Low: low, Action: action}); err != nil {
+			fmt.Fprintf(os.Stderr, "警告: 保存配置失败: %v\n", err)
+		}
+	} else if cfg, ok := loadConfig(); ok {
+		gLowBattery = newLowBatteryGuard(cfg.Low, cfg.Action)
+	} else {
+		gLowBattery = newLowBatteryGuard(low, action)
 	}
-	gLowBattery = newLowBatteryGuard(*fLow, *fAction)
 
 	initConsole()
 
@@ -308,6 +326,9 @@ func runConsole() {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 
+	// 后台读取终端命令（输入 c 进入设置菜单；输入 q 退出）
+	go stdinLoop()
+
 	var (
 		frames   int
 		lastMode = protocol.ModeUnknown
@@ -381,6 +402,11 @@ func runConsole() {
 		}
 		if len(events) > 6 {
 			events = events[len(events)-6:]
+		}
+
+		// 配置菜单期间暂停面板刷新与保护评估，避免与菜单输入互相干扰
+		if atomic.LoadInt32(&consolePaused) != 0 {
+			continue
 		}
 
 		if cw != nil {
@@ -534,8 +560,116 @@ func render(dev *hid.Device, s *protocol.Sample, frames int, fps float64, events
 		fmt.Fprintf(&b, "  %s%s%s\n", cDim, s.RawHex(), cReset)
 	}
 
-	b.WriteString("\n  " + cDim + "按 Ctrl+C 退出" + cReset + "\n")
+	b.WriteString("\n  " + cDim + "按 c 进入设置 · Ctrl+C 退出" + cReset + "\n")
 	fmt.Print(b.String())
+}
+
+// ---------------------------------------------------------------- 终端设置菜单
+
+// stdinLoop 持续读取终端输入行，识别交互命令。
+func stdinLoop() {
+	r := bufio.NewReader(os.Stdin)
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return
+		}
+		switch strings.TrimSpace(line) {
+		case "c", "config", "C":
+			configMenu(r)
+		case "q", "Q":
+			fmt.Println("\n收到退出指令，正在停止…")
+			os.Exit(0)
+		}
+	}
+}
+
+// configMenu 在终端中交互式修改低电量保护设置，并持久化到配置文件。
+func configMenu(r *bufio.Reader) {
+	atomic.StoreInt32(&consolePaused, 1)
+	defer atomic.StoreInt32(&consolePaused, 0)
+	fmt.Print("\033[2J\033[H")
+
+	for {
+		en, low, act := gLowBattery.Snapshot()
+		fmt.Printf("\n%s低电量自动保护 · 设置%s\n\n", cBold+cCyan, cReset)
+		status := "已禁用"
+		if en {
+			status = fmt.Sprintf("已启用（电量 < %d%% 时 %s）", low, actionName(act))
+		}
+		fmt.Printf("  当前状态: %s%s%s\n\n", cBold, status, cReset)
+		fmt.Printf("  %s1%s) 修改电量阈值（当前 %d%%）\n", cGreen, cReset, low)
+		fmt.Printf("  %s2%s) 修改动作（当前 %s）\n", cGreen, cReset, actionName(act))
+		fmt.Printf("  %s3%s) %s保护\n", cGreen, cReset, map[bool]string{true: "禁用", false: "启用"}[en])
+		fmt.Printf("  %s4%s) 保存并返回\n", cGreen, cReset)
+		fmt.Printf("  %sq%s) 不保存退出\n\n", cYellow, cReset)
+		fmt.Printf("  请选择: ")
+
+		line, _ := r.ReadString('\n')
+		switch strings.TrimSpace(line) {
+		case "1":
+			fmt.Printf("  请输入电量阈值 (1-100，0=禁用): ")
+			t, _ := r.ReadString('\n')
+			n, err := strconv.Atoi(strings.TrimSpace(t))
+			if err != nil || n < 0 || n > 100 {
+				fmt.Printf("  %s无效输入%s\n", cRed, cReset)
+				time.Sleep(900 * time.Millisecond)
+				continue
+			}
+			gLowBattery.Configure(true, n, act)
+			fmt.Printf("  %s已设为 %d%%（未保存，按 4 保存）%s\n", cGreen, n, cReset)
+			time.Sleep(700 * time.Millisecond)
+		case "2":
+			fmt.Printf("  选择动作: %s1%s=关机 %s2%s=睡眠 %s3%s=休眠 %s4%s=仅提示 : ",
+				cGreen, cReset, cGreen, cReset, cGreen, cReset, cGreen, cReset)
+			a, _ := r.ReadString('\n')
+			var na string
+			switch strings.TrimSpace(a) {
+			case "1":
+				na = "shutdown"
+			case "2":
+				na = "sleep"
+			case "3":
+				na = "hibernate"
+			case "4":
+				na = "none"
+			default:
+				fmt.Printf("  %s无效选择%s\n", cRed, cReset)
+				time.Sleep(900 * time.Millisecond)
+				continue
+			}
+			gLowBattery.Configure(en, low, na)
+			fmt.Printf("  %s动作已设为 %s（未保存，按 4 保存）%s\n", cGreen, actionName(na), cReset)
+			time.Sleep(700 * time.Millisecond)
+		case "3":
+			if en {
+				gLowBattery.Configure(false, low, act)
+				fmt.Printf("  %s保护已禁用%s\n", cYellow, cReset)
+			} else {
+				nl := low
+				if nl == 0 {
+					nl = 20
+				}
+				gLowBattery.Configure(true, nl, act)
+				fmt.Printf("  %s保护已启用（阈值 %d%%）%s\n", cGreen, nl, cReset)
+			}
+			time.Sleep(700 * time.Millisecond)
+		case "4":
+			_, low2, act2 := gLowBattery.Snapshot()
+			if err := saveConfig(AppConfig{Low: low2, Action: act2}); err != nil {
+				fmt.Printf("  %s保存失败: %v%s\n", cRed, err, cReset)
+				time.Sleep(900 * time.Millisecond)
+				continue
+			}
+			fmt.Printf("  %s已保存到 %s%s\n", cGreen, configPath, cReset)
+			time.Sleep(700 * time.Millisecond)
+			fmt.Print("\033[2J\033[H")
+			return
+		case "q", "Q", "":
+			fmt.Print("\033[2J\033[H")
+			return
+		}
+	}
 }
 
 func section(name string) string {
