@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>UGREEN US3000 UPS 监控</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  :root{
+    --bg:#f4f6fa; --card:#fff; --bd:#e3e8f0; --tx:#1f2937; --tx2:#6b7280;
+    --blue:#2563eb; --green:#16a34a; --amber:#d97706; --red:#dc2626; --purple:#7c3aed;
+  }
+  body{background:var(--bg);color:var(--tx);
+    font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+    padding:20px;line-height:1.5}
+  .wrap{max-width:1180px;margin:0 auto}
+  header{display:flex;align-items:center;justify-content:space-between;
+    flex-wrap:wrap;gap:12px;margin-bottom:18px}
+  h1{font-size:20px;font-weight:650;display:flex;align-items:center;gap:10px}
+  .dot{width:10px;height:10px;border-radius:50%;background:var(--green);
+    box-shadow:0 0 0 4px rgba(22,163,74,.15)}
+  .dot.ob{background:var(--red);box-shadow:0 0 0 4px rgba(220,38,38,.15)}
+  .dot.chg{background:var(--amber);box-shadow:0 0 0 4px rgba(217,119,6,.15)}
+  .meta{color:var(--tx2);font-size:13px}
+  .badge{padding:4px 11px;border-radius:999px;font-size:12px;font-weight:600;
+    background:rgba(37,99,235,.09);color:var(--blue)}
+  .badge.g{background:rgba(22,163,74,.1);color:var(--green)}
+  .badge.r{background:rgba(220,38,38,.1);color:var(--red)}
+  .badge.a{background:rgba(217,119,6,.12);color:var(--amber)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:16px}
+  .card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:14px 16px;
+    box-shadow:0 1px 2px rgba(16,24,40,.04)}
+  .card .k{color:var(--tx2);font-size:12px;letter-spacing:.02em;margin-bottom:6px}
+  .card .v{font-size:24px;font-weight:650;font-variant-numeric:tabular-nums}
+  .card .u{font-size:13px;color:var(--tx2);font-weight:500;margin-left:2px}
+  .card .s{font-size:11px;color:var(--tx2);margin-top:4px}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
+  @media(max-width:820px){.row{grid-template-columns:1fr}}
+  .panel{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:14px 16px}
+  .panel h3{font-size:13px;font-weight:600;margin-bottom:10px;color:var(--tx);
+    display:flex;justify-content:space-between;align-items:center}
+  .legend{display:flex;gap:12px;font-size:11px;color:var(--tx2);font-weight:500}
+  .legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px}
+  canvas{width:100%;height:190px;display:block}
+  .cells{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+  @media(max-width:640px){.cells{grid-template-columns:repeat(2,1fr)}}
+  .cell{background:var(--bg);border-radius:8px;padding:10px}
+  .cell .n{font-size:11px;color:var(--tx2);margin-bottom:4px}
+  .cell .v{font-size:17px;font-weight:650;font-variant-numeric:tabular-nums}
+  .bar{height:6px;border-radius:3px;background:#e5e7eb;margin-top:7px;overflow:hidden}
+  .bar>i{display:block;height:100%;border-radius:3px;transition:width .4s}
+  .events{max-height:150px;overflow:auto;font-size:12px;color:var(--tx2)}
+  .events div{padding:4px 0;border-bottom:1px dashed var(--bd)}
+  .events div:last-child{border:0}
+  .err{background:rgba(220,38,38,.08);border:1px solid rgba(220,38,38,.25);
+    color:var(--red);padding:10px 14px;border-radius:10px;margin-bottom:14px;font-size:13px}
+  footer{color:var(--tx2);font-size:12px;text-align:center;margin-top:18px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1><span class="dot" id="dot"></span><span id="title">UGREEN US3000 UPS</span></h1>
+    <div class="meta">
+      <span class="badge" id="badge">连接中…</span>
+      <span id="metaTxt" style="margin-left:8px"></span>
+    </div>
+  </header>
+
+  <div id="err" class="err" style="display:none"></div>
+
+  <div class="grid" id="cards"></div>
+
+  <div class="row">
+    <div class="panel">
+      <h3>电压趋势 <span class="legend">
+        <span><i style="background:#2563eb"></i>输入电压</span>
+        <span><i style="background:#16a34a"></i>电池电压</span></span></h3>
+      <canvas id="cVolt"></canvas>
+    </div>
+    <div class="panel">
+      <h3>电流与功率 <span class="legend">
+        <span><i style="background:#d97706"></i>电流 (A)</span>
+        <span><i style="background:#7c3aed"></i>功率 (W)</span></span></h3>
+      <canvas id="cPow"></canvas>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="panel">
+      <h3>电量与负载 <span class="legend">
+        <span><i style="background:#16a34a"></i>电量 %</span>
+        <span><i style="background:#dc2626"></i>负载 %</span></span></h3>
+      <canvas id="cSoc"></canvas>
+    </div>
+    <div class="panel">
+      <h3>电芯电压 (4S)<span class="legend" id="deltaTxt"></span></h3>
+      <div class="cells" id="cells"></div>
+      <h3 style="margin-top:14px">事件日志</h3>
+      <div class="events" id="events"><div>等待数据…</div></div>
+    </div>
+  </div>
+
+  <footer>数据每秒刷新 · 直接读取 USB HID，无需驱动 · Ctrl+C 停止服务端</footer>
+</div>
+
+<script>
+const HIST = [];
+const MAXP = 300;
+let primed = false;
+
+function fmtDur(sec){
+  if(sec === undefined || sec === null || sec < 0) return '—';
+  const h = Math.floor(sec/3600), m = Math.floor(sec%3600/60), s = sec%60;
+  if(h>0) return h+' 小时 '+m+' 分';
+  if(m>0) return m+' 分 '+s+' 秒';
+  return s+' 秒';
+}
+
+function cardHTML(items){
+  return items.map(it=>`
+    <div class="card">
+      <div class="k">${it.k}</div>
+      <div class="v" style="color:${it.c||'var(--tx)'}">${it.v}<span class="u">${it.u||''}</span></div>
+      ${it.s?`<div class="s">${it.s}</div>`:''}
+    </div>`).join('');
+}
+
+async function tick(){
+  try{
+    const r = await fetch('/api/status', {cache:'no-store'});
+    const d = await r.json();
+    render(d);
+  }catch(e){
+    document.getElementById('err').style.display='block';
+    document.getElementById('err').textContent='无法连接服务端: '+e;
+  }
+}
+
+function render(d){
+  const errBox = document.getElementById('err');
+  if(d.error){ errBox.style.display='block'; errBox.textContent='设备错误: '+d.error; }
+  else errBox.style.display='none';
+
+  const s = d.sample;
+  if(!s){ return; }
+
+  // 头部
+  const ob = s.status_code === 'OB';
+  const chg = s.charging;
+  document.getElementById('dot').className = 'dot'+(ob?' ob':(chg?' chg':''));
+  document.getElementById('title').textContent =
+    (d.device.manufacturer||'UGREEN')+' '+(d.device.product||'US3000');
+  const b = document.getElementById('badge');
+  b.textContent = s.status;
+  b.className = 'badge'+(ob?' r':(chg?' a':' g'));
+  document.getElementById('metaTxt').textContent =
+    'VID:'+d.device.vendor_id+' PID:'+d.device.product_id+
+    ' · 固件 '+d.device.firmware+' · SN:'+d.device.serial+' · 第 '+d.frames+' 帧';
+
+  // 历史
+  HIST.push({t:Date.now(), inv:s.input_voltage_v, batv:s.battery_voltage_v,
+    cur:s.input_current_a, pow:s.input_power_w, soc:s.battery_charge_percent,
+    load:s.load_valid?s.load_percent:0});
+  if(HIST.length>MAXP) HIST.shift();
+
+  // 卡片
+  const socC = s.battery_charge_percent>=60?'var(--green)':
+              (s.battery_charge_percent>=30?'var(--amber)':'var(--red)');
+  document.getElementById('cards').innerHTML = cardHTML([
+    {k:'工作状态', v:s.status_code, u:'', c:ob?'var(--red)':(chg?'var(--amber)':'var(--green)'), s:s.status},
+    {k:'输入电压', v:s.input_voltage_v.toFixed(3), u:'V'},
+    {k:'输入电流', v:s.input_current_a.toFixed(3), u:'A'},
+    {k:'功率', v:s.input_power_w.toFixed(2), u:'W'},
+    {k:'负载', v:s.load_valid?s.load_percent:'—', u:s.load_valid?'%':'',
+      s:s.load_valid?'':'当前模式无有效负载读数'},
+    {k:'电池电量', v:s.battery_charge_percent, u:'%', c:socC, s:'标称容量 43 Wh'},
+    {k:'电池电压', v:s.battery_voltage_v.toFixed(3), u:'V',
+      s:'电芯合计 '+s.cell_voltages_v.reduce((a,b)=>a+b,0).toFixed(3)+' V'},
+    {k:'充电电流', v:s.charge_current_ma.toFixed(0), u:'mA',
+      s:s.charging?'充电中':'未充电'},
+    {k:'剩余运行时间', v:fmtDur(s.runtime_seconds), u:'',
+      s:ob?('来源: '+s.runtime_source):'断电后预计可维持'},
+    {k:'输出电压', v:ob?s.output_voltage_v.toFixed(3):'—', u:ob?'V':'',
+      s:ob?'稳压输出':'仅电池供电时上报'},
+  ]);
+
+  // 电芯
+  document.getElementById('cells').innerHTML = s.cell_voltages_v.map((v,i)=>{
+    const c = v<3.3?'var(--red)':(v<3.6?'var(--amber)':'var(--green)');
+    const pct = Math.max(0, Math.min(100, (v-3.0)/(4.2-3.0)*100));
+    return `<div class="cell"><div class="n">电芯 ${i+1}</div>
+      <div class="v" style="color:${c}">${v.toFixed(3)}<span class="u">V</span></div>
+      <div class="bar"><i style="width:${pct}%;background:${c}"></i></div></div>`;
+  }).join('');
+  document.getElementById('deltaTxt').innerHTML =
+    '<span>压差 '+s.cell_delta_mv.toFixed(0)+' mV · '+s.battery_health+'</span>';
+
+  // 事件
+  if(d.events && d.events.length){
+    document.getElementById('events').innerHTML =
+      d.events.slice().reverse().map(e=>'<div>'+e+'</div>').join('');
+  }
+
+  draw();
+}
+
+function setupCanvas(id){
+  const cv = document.getElementById(id);
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if(cv.width !== w*dpr || cv.height !== h*dpr){
+    cv.width = w*dpr; cv.height = h*dpr;
+  }
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,w,h);
+  return {ctx, w, h};
+}
+
+function plot(id, series, unit){
+  const {ctx,w,h} = setupCanvas(id);
+  const padL=42, padR=8, padT=8, padB=18;
+  const iw = w-padL-padR, ih = h-padT-padB;
+
+  let min=Infinity, max=-Infinity;
+  series.forEach(s=>s.data.forEach(v=>{ if(v<min)min=v; if(v>max)max=v; }));
+  if(min===Infinity){ min=0; max=1; }
+  if(min===max){ min-=0.5; max+=0.5; }
+  const pad=(max-min)*0.15; min-=pad; max+=pad;
+
+  // 网格
+  ctx.strokeStyle='#eef1f6'; ctx.lineWidth=1; ctx.font='10px system-ui';
+  ctx.fillStyle='#9aa3b2'; ctx.textAlign='right'; ctx.textBaseline='middle';
+  for(let i=0;i<=4;i++){
+    const y = padT + ih*i/4;
+    ctx.beginPath(); ctx.moveTo(padL,y); ctx.lineTo(w-padR,y); ctx.stroke();
+    const val = max-(max-min)*i/4;
+    ctx.fillText(val.toFixed(unit.dec), padL-6, y);
+  }
+
+  const n = series[0].data.length;
+  if(n<2) return;
+  series.forEach(s=>{
+    ctx.strokeStyle=s.color; ctx.lineWidth=2; ctx.lineJoin='round';
+    ctx.beginPath();
+    s.data.forEach((v,i)=>{
+      const x = padL + iw*i/(n-1);
+      const y = padT + ih*(1-(v-min)/(max-min));
+      i?ctx.lineTo(x,y):ctx.moveTo(x,y);
+    });
+    ctx.stroke();
+  });
+}
+
+function draw(){
+  if(HIST.length<1) return;
+  plot('cVolt',[
+    {data:HIST.map(p=>p.inv),  color:'#2563eb'},
+    {data:HIST.map(p=>p.batv), color:'#16a34a'}
+  ],{dec:2});
+  plot('cPow',[
+    {data:HIST.map(p=>p.cur), color:'#d97706'},
+    {data:HIST.map(p=>p.pow), color:'#7c3aed'}
+  ],{dec:2});
+  plot('cSoc',[
+    {data:HIST.map(p=>p.soc),  color:'#16a34a'},
+    {data:HIST.map(p=>p.load), color:'#dc2626'}
+  ],{dec:0});
+}
+
+async function prime(){
+  try{
+    const r = await fetch('/api/history',{cache:'no-store'});
+    const h = await r.json();
+    if(Array.isArray(h)){
+      h.slice(-MAXP).forEach(p=>HIST.push({
+        t:p.t*1000, inv:p.inv, batv:p.batv, cur:p.cur, pow:p.power,
+        soc:p.soc, load:p.load
+      }));
+      if(HIST.length>MAXP) HIST.splice(0, HIST.length-MAXP);
+    }
+  }catch(e){}
+  primed = true;
+  draw();
+}
+
+window.addEventListener('resize', draw);
+prime();
+tick();
+setInterval(tick, 1000);
+</script>
+</body>
+</html>

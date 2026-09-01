@@ -1,0 +1,15 @@
+# Build artifacts (distribute binaries via GitHub Releases instead)
+*.exe
+ups-monitor
+
+# Go test / coverage output
+*.test
+*.out
+coverage.*
+
+# Editor / OS noise
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store
