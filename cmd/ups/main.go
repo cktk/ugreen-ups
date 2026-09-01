@@ -547,6 +547,23 @@ func render(dev *hid.Device, s *protocol.Sample, frames int, fps float64, events
 	kv2(&b, "压差", fmt.Sprintf("%s%.0f mV%s", dcol, delta, cReset),
 		"均衡评估", s.Health())
 
+	// 低电量自动保护：在主面板常驻显示当前配置（与网页端一致）
+	if gLowBattery != nil {
+		en, low, act := gLowBattery.Snapshot()
+		b.WriteString(section("低电量自动保护"))
+		var status string
+		if en {
+			status = fmt.Sprintf("已启用（电量 < %d%% 时 %s）", low, actionName(act))
+		} else {
+			status = fmt.Sprintf("已禁用（电量 < %d%% 时 %s）", low, actionName(act))
+		}
+		dot := cDim + "○" + cReset
+		if en {
+			dot = cGreen + "●" + cReset
+		}
+		fmt.Fprintf(&b, "  %s %s%s%s\n", dot, cBold, status, cReset)
+	}
+
 	// 事件
 	if len(events) > 0 {
 		b.WriteString(section("事件"))
