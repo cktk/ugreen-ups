@@ -11,5 +11,7 @@ coverage.*
 .idea/
 .vscode/
 *.swp
+*.exe~
+*~
 Thumbs.db
 .DS_Store
