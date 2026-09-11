@@ -39,9 +39,22 @@ var (
 	user32          = syscall.NewLazyDLL("user32.dll")
 	procMessageBoxW = user32.NewProc("MessageBoxW")
 	logFile         *os.File
+	logPath         string // 当前日志文件路径（滚动时用）
+	logSize         int64  // 当前日志文件已写入字节数
 )
 
 // ---------------------------------------------------------------- 日志 / 崩溃提示
+
+// 程序设计为可连续运行数年，日志必须自己管住，否则会无限增长把磁盘写满。
+// 策略：单文件超过 logMaxBytes 就滚动，历史文件编号 .1/.2/.3，最多保留 logKeepFiles 份。
+// 日志只记录事件与心跳（不逐帧落盘）：心跳每 logBeatInterval 一条，
+// 按此频率每份文件约覆盖 2 个月，四份加起来足够回溯大半年的运行情况。
+const (
+	logMaxBytes  = 2 << 20 // 2 MiB
+	logKeepFiles = 3
+
+	logBeatInterval = 5 * time.Minute // 心跳日志间隔
+)
 
 // logInit 打开日志文件（与可执行文件同目录，失败则退回临时目录）。
 // GUI 子系统无控制台，所有诊断信息走文件 + 弹窗。
@@ -56,16 +69,59 @@ func logInit() {
 		if err != nil {
 			return
 		}
+		path = f.Name()
 	}
-	logFile = f
+	logFile, logPath = f, path
+	if st, err := f.Stat(); err == nil {
+		logSize = st.Size()
+	}
+	if logSize >= logMaxBytes {
+		// 上次退出时就已写满（例如长时间断连刷屏），立刻滚一次再继续
+		rotateLog("启动时发现日志已超限")
+	}
 }
 
 func logf(format string, a ...any) {
 	if logFile == nil {
 		return
 	}
-	fmt.Fprintf(logFile, time.Now().Format("2006-01-02 15:04:05.000 ")+format+"\n", a...)
+	n, err := fmt.Fprintf(logFile,
+		time.Now().Format("2006-01-02 15:04:05.000 ")+format+"\n", a...)
+	if err != nil {
+		return
+	}
 	_ = logFile.Sync()
+	logSize += int64(n)
+	if logSize >= logMaxBytes {
+		rotateLog(fmt.Sprintf("达到 %d MiB 上限", logMaxBytes>>20))
+	}
+}
+
+// rotateLog 归档当前日志并新建空文件：log → log.1 → log.2 → … 超出 logKeepFiles 的丢弃。
+// 只保留固定份数，因此磁盘占用有上限，长期运行不会撑爆。
+func rotateLog(reason string) {
+	if logFile == nil || logPath == "" {
+		return
+	}
+	_ = logFile.Close()
+	logFile = nil
+
+	// 从最旧一份开始往后挪，避免相互覆盖
+	for i := logKeepFiles - 1; i >= 1; i-- {
+		_ = os.Rename(fmt.Sprintf("%s.%d", logPath, i), fmt.Sprintf("%s.%d", logPath, i+1))
+	}
+	_ = os.Rename(logPath, logPath+".1")
+
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return
+	}
+	logFile = f
+	logSize = 0
+	n, _ := fmt.Fprintf(f, "%s=== 日志已滚动（%s，保留 %d 份历史 .1-.%d）===\n",
+		time.Now().Format("2006-01-02 15:04:05.000 "), reason, logKeepFiles, logKeepFiles)
+	_ = f.Sync()
+	logSize += int64(n)
 }
 
 // msgBox 用原生 Win32 弹窗显示错误（不依赖 walk，即使 GUI 初始化失败也能提示用户）。
@@ -793,9 +849,14 @@ type guiRefs struct {
 	socBar  *walk.ProgressBar
 	socTxt  *walk.Label
 	v       map[string]*walk.Label // 各指标值标签（按中文键索引）
+	rtBasis *walk.Label            // 本地续航估算的依据说明（小灰字）
 	chart   *cellChart             // 电芯电压柱状图 + 压差历史折线
 	cellSum *walk.Label            // 电芯合计量值（图表下方补充说明）
 	footer  *walk.Label
+
+	// 底部一行保存统计片段，由 setStats() 填；footerURL 由 update() 填
+	footerURL string
+	runLbl    *walk.Label
 
 	// 低电量保护设置控件
 	cfgMsg   *walk.Label
@@ -905,11 +966,14 @@ func runGUI() {
 
 	vals := map[string]*walk.Label{}
 	vBattV, vCellSum := kv(battGb, "电池电压", "电芯合计", f)
-	vChg, vRuntime := kv(battGb, "充电电流", "预计续航", f)
-	vHealth, _ := kv(battGb, "均衡评估", "", f)
+	vChg, vHealth := kv(battGb, "充电电流", "均衡评估", f)
+	// 剩余续航分两个来源展示：设备上报（仅电池供电时固件才给值）+ 本地估算
+	vRtDev, vRtLocal := kv(battGb, "设备续航", "本地估算", f)
+	rtBasisLbl := lbl(battGb, "—", nz(f.small, f.normal))
+	endRow(battGb) // 让分组横向撑满，否则上面那行小字会被居中
 	vals["电池电压"], vals["电芯合计"] = vBattV, vCellSum
-	vals["充电电流"], vals["预计续航"] = vChg, vRuntime
-	vals["均衡评估"] = vHealth
+	vals["充电电流"], vals["均衡评估"] = vChg, vHealth
+	vals["设备续航"], vals["本地估算"] = vRtDev, vRtLocal
 
 	// ---- 电力 ----
 	powerGb := group(mw, "电力", f)
@@ -1009,10 +1073,12 @@ func runGUI() {
 
 	// ---- 底部提示 ----
 	footerLbl := lbl(mw, "关闭窗口将最小化到托盘 · 右键托盘图标：打开 Web 页面 / 打开 GUI / 退出", nz(f.small, f.normal))
+	// 长期运行统计：运行时长 / 累计帧数 / 日志滚动策略，随轮询刷新
+	runLbl := lbl(mw, "—", nz(f.small, f.normal))
 
 	refs := &guiRefs{
 		banner: bn, dev: devLbl, socBar: socBar, socTxt: socTxt,
-		v: vals, chart: chart, cellSum: cellSumLbl, footer: footerLbl,
+		v: vals, rtBasis: rtBasisLbl, chart: chart, cellSum: cellSumLbl, footer: footerLbl, runLbl: runLbl,
 		cfgMsg: cfgMsg, cbEnable: cbEnable, neLow: neLow, radios: radios, cbAuto: cbAuto,
 	}
 	_ = pathLbl
@@ -1131,14 +1197,39 @@ func runGUI() {
 	})
 
 	// 定时轮询监控数据并更新界面
+	// 顺带在日志里留下"长期运行"痕迹：状态切换即时记录，其余每 logBeatInterval 一条心跳。
+	// 逐帧落盘会让日志暴涨且毫无信息量，这里只记事件 —— 配合滚动策略，跑几年也不怕。
 	go guard("poll", func() {
 		tick := time.NewTicker(time.Duration(*fInterval) * time.Millisecond)
 		defer tick.Stop()
+		var lastStatus string
+		lastBeat := time.Now()
 		for range tick.C {
-			s, di, _, perr := pollStatus()
-			snapshot, devInfo, pollErr := s, di, perr
+			s, di, _, frames, perr := pollStatus()
+			snapshot, devInfo, pollErr, n := s, di, perr, frames
+
+			if snapshot != nil {
+				if snapshot.Status != lastStatus {
+					if lastStatus != "" {
+						logf("状态切换: %s → %s（电量 %d%%，负载 %d%%）",
+							lastStatus, snapshot.Status, snapshot.ChargePercent, snapshot.LoadPercent)
+					}
+					lastStatus = snapshot.Status
+				}
+				if time.Since(lastBeat) >= logBeatInterval {
+					lastBeat = time.Now()
+					rt := snapshot.Runtime()
+					logf("心跳: %s 电量=%d%% 负载=%d%% 输入=%.2fV/%.3fA 电池=%.3fV/%.0fmA 设备续航=%s 本地估算=%s 累计=%s 帧",
+						snapshot.Status, snapshot.ChargePercent, snapshot.LoadPercent,
+						snapshot.InputVoltage, snapshot.InputCurrent,
+						snapshot.BatteryVoltage, snapshot.ChargeCurrent,
+						fmtDuration(rt.DeviceSec), fmtDuration(rt.LocalSec), fmtFrames(n))
+				}
+			}
+
 			mw.Synchronize(func() {
 				refs.update(snapshot, devInfo, pollErr)
+				refs.setStats(n)
 			})
 		}
 	})
@@ -1175,8 +1266,9 @@ func runGUI() {
 
 // update 将最新样本刷新到 GUI 控件（必须在 UI 线程调用，外部用 Synchronize 包住）。
 func (r *guiRefs) update(s *protocol.Sample, di deviceInfo, connErr error) {
-	if gDashboardURL != "" {
-		r.footer.SetText("Web 仪表盘：" + gDashboardURL + "  ·  关闭窗口将最小化到托盘")
+	if gDashboardURL != "" && r.footerURL != gDashboardURL {
+		r.footerURL = gDashboardURL
+		r.renderFooter()
 	}
 
 	if connErr != nil || s == nil {
@@ -1188,6 +1280,15 @@ func (r *guiRefs) update(s *protocol.Sample, di deviceInfo, connErr error) {
 			r.chart.clear()
 		}
 		r.setCellSum("—")
+		if r.rtBasis != nil {
+			_ = r.rtBasis.SetText("—")
+		}
+		for _, k := range []string{"电池电压", "电芯合计", "充电电流", "均衡评估", "设备续航", "本地估算",
+			"输入电压", "输入电流", "输入功率", "负载"} {
+			if l, ok := r.v[k]; ok {
+				_ = l.SetText("—")
+			}
+		}
 		return
 	}
 
@@ -1206,7 +1307,8 @@ func (r *guiRefs) update(s *protocol.Sample, di deviceInfo, connErr error) {
 	r.banner.set(title, s.Status,
 		fmt.Sprintf("USB HID  VID:%s  PID:%s", di.VendorID, di.ProductID),
 		fmt.Sprintf("%d%%", s.ChargePercent), "剩余电量")
-	r.dev.SetText(fmt.Sprintf("固件 %s  ·  序列号 %s", di.Firmware, di.Serial))
+	r.dev.SetText(fmt.Sprintf("固件 %s  ·  硬件 %s  ·  USB %s  ·  序列号 %s",
+		di.Firmware, di.Hardware, di.USBVersion, di.Serial))
 
 	r.socTxt.SetText(fmt.Sprintf("%d%%", s.ChargePercent))
 	r.socBar.SetValue(s.ChargePercent)
@@ -1214,12 +1316,27 @@ func (r *guiRefs) update(s *protocol.Sample, di deviceInfo, connErr error) {
 	set("电池电压", fmt.Sprintf("%.3f V", s.BatteryVoltage))
 	set("电芯合计", fmt.Sprintf("%.3f V", s.CellSum()))
 	set("充电电流", fmt.Sprintf("%.0f mA", s.ChargeCurrent))
-	if rt, _ := s.RuntimeEstimate(); rt > 0 {
-		set("预计续航", fmtDuration(rt))
-	} else {
-		set("预计续航", "—")
-	}
 	set("均衡评估", s.Health())
+
+	// 剩余续航：设备上报值与本地估算值并列展示，二者口径不同、不互相替代
+	rt := s.Runtime()
+	if rt.DeviceSec > 0 {
+		set("设备续航", fmtDuration(rt.DeviceSec))
+	} else {
+		set("设备续航", "—")
+	}
+	if rt.LocalSec > 0 {
+		set("本地估算", fmtDuration(rt.LocalSec))
+	} else {
+		set("本地估算", "—")
+	}
+	basis := rt.Basis
+	if rt.DeviceSec <= 0 {
+		basis += "　·　设备续航需电池供电时才由固件给出"
+	}
+	if r.rtBasis != nil {
+		_ = r.rtBasis.SetText("估算依据：" + basis)
+	}
 
 	set("输入电压", fmt.Sprintf("%.3f V", s.InputVoltage))
 	set("输入电流", fmt.Sprintf("%.3f A", s.InputCurrent))
@@ -1242,6 +1359,29 @@ func (r *guiRefs) setCellSum(text string) {
 	if r.cellSum != nil {
 		_ = r.cellSum.SetText(text)
 	}
+}
+
+// setStats 刷新底部长期运行统计（已运行时长 + 累计帧数）。
+// 程序按年运行是常态，光看帧数没概念，配上运行时长才读得懂；
+// 帧数超过 1 亿（约 3.2 年 @1Hz）后改用「亿」表示，避免一长串数字挤爆底栏。
+func (r *guiRefs) setStats(frames int) {
+	if r.runLbl == nil {
+		return
+	}
+	_ = r.runLbl.SetText(fmt.Sprintf("已运行 %s  ·  累计 %s 帧  ·  日志按 %d MiB × %d 份滚动",
+		fmtDuration(int(time.Since(runStart).Seconds())), fmtFrames(frames),
+		logMaxBytes>>20, logKeepFiles))
+}
+
+// renderFooter 由 URL 片段与固定提示拼出底部整行文本。
+func (r *guiRefs) renderFooter() {
+	if r.footer == nil {
+		return
+	}
+	if r.footerURL == "" {
+		return
+	}
+	_ = r.footer.SetText("Web 仪表盘：" + r.footerURL + "  ·  关闭窗口将最小化到托盘")
 }
 
 // ---------------------------------------------------------------- 设备列表窗口

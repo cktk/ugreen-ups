@@ -142,14 +142,14 @@ const (
 	digcfPresent         = 0x00000002
 	digcfDeviceInterface = 0x00000010
 
-	genericRead       = 0x80000000
-	genericWrite      = 0x40000000
-	fileShareRead     = 0x00000001
-	fileShareWrite    = 0x00000002
-	openExisting      = 3
+	genericRead        = 0x80000000
+	genericWrite       = 0x40000000
+	fileShareRead      = 0x00000001
+	fileShareWrite     = 0x00000002
+	openExisting       = 3
 	fileFlagOverlapped = 0x40000000
 
-	waitTimeout   = 0x00000102
+	waitTimeout    = 0x00000102
 	errorIOPending = 997
 
 	hidpInput   = 0
@@ -508,9 +508,25 @@ func main() {
 		if caps.FeatureReportByteLength > 0 {
 			fmt.Printf("  --- Feature 报告探测 (长度 %d) ---\n", caps.FeatureReportByteLength)
 			flen := int(caps.FeatureReportByteLength)
+			// 先把描述符里声明过的 Report ID 全部收进来（厂商自定义的 0xFE/0xFF 等
+			// 往往才是版本/字符串所在），再补齐 1..32 里没被声明的那些。
+			seen := map[byte]bool{}
+			ids := make([]byte, 0, 48)
+			add := func(id byte) {
+				if id != 0 && !seen[id] {
+					seen[id] = true
+					ids = append(ids, id)
+				}
+			}
+			for _, vc := range getValueCaps(preparsed, hidpFeature, int(caps.NumberFeatureValueCaps)) {
+				add(vc.ReportID)
+			}
 			for rid := 1; rid <= 32; rid++ {
+				add(byte(rid))
+			}
+			for _, rid := range ids {
 				buf := make([]byte, flen)
-				buf[0] = byte(rid)
+				buf[0] = rid
 				ret, _, _ := procHidDGetFeature.Call(uintptr(h),
 					uintptr(unsafe.Pointer(&buf[0])), uintptr(flen))
 				if ret != 0 {
@@ -519,6 +535,14 @@ func main() {
 				}
 			}
 		}
+
+		// 关于固件版本：**不要**拿 HidD_GetIndexedString 去遍历字符串描述符索引。
+		// 该设备的固件版本在 Feature 报告 0x10 的 iVersionNumber 字段里只给“索引”，
+		// 而这一版固件对上位机按索引取字符串的请求会卡住：每个不存在的索引都要走一次
+		// 控制传输超时（约 3.5s），并且连续扫下来会把设备固件挂死——必须重新插拔
+		// USB 才能恢复。实测该设备的 USB bcdDevice（HIDD_ATTRIBUTES.VersionNumber）
+		// 报的是 1.00，那只是 USB 接口版本；真正的固件版本在私有遥测帧头 [1]/[2]，
+		// 由 protocol.Version 解析（实测 03 03 → V3.3）。
 
 		procHidDFreePreparsedData.Call(preparsed)
 		procCloseHandle.Call(uintptr(h))

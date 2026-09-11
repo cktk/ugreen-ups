@@ -74,19 +74,9 @@ func newMonitor(dev *hid.Device) *monitor {
 		interval: time.Duration(*fInterval) * time.Millisecond,
 	}
 	if dev != nil {
-		m.info = deviceInfo{
-			Manufacturer: dev.Manufacturer,
-			Product:      dev.Product,
-			Serial:       dev.Serial,
-			VendorID:     fmt.Sprintf("%04X", dev.VendorID),
-			ProductID:    fmt.Sprintf("%04X", dev.ProductID),
-			Firmware:     fmt.Sprintf("%d.%02d", dev.Version>>8, dev.Version&0xFF),
-		}
+		m.info = deviceInfoFrom(dev)
 	} else {
-		m.info = deviceInfo{
-			Manufacturer: "UGREEN", Product: "US3000",
-			Serial: "—", VendorID: "2B89", ProductID: "FFFF", Firmware: "—",
-		}
+		m.info = deviceInfoFrom(nil)
 	}
 	return m
 }
@@ -138,6 +128,7 @@ func (m *monitor) readOnce() {
 	}
 	m.lastErr = ""
 	m.frames++
+	m.info.applyVersion(s.Version) // 固件/硬件/协议版本来自遥测帧头
 
 	// 周期性用 BMS Feature 报告校准 SOC
 	if m.frames%30 == 1 {
@@ -195,14 +186,7 @@ func (m *monitor) tryReconnect() {
 	if nd, e := openUPS(); e == nil {
 		m.mu.Lock()
 		m.dev = nd
-		m.info = deviceInfo{
-			Manufacturer: nd.Manufacturer,
-			Product:      nd.Product,
-			Serial:       nd.Serial,
-			VendorID:     fmt.Sprintf("%04X", nd.VendorID),
-			ProductID:    fmt.Sprintf("%04X", nd.ProductID),
-			Firmware:     fmt.Sprintf("%d.%02d", nd.Version>>8, nd.Version&0xFF),
-		}
+		m.info = deviceInfoFrom(nd)
 		m.lastErr = ""
 		m.addEvent("设备已重新连接")
 		m.mu.Unlock()

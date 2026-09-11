@@ -39,6 +39,10 @@ var (
 	procAttachConsole      = k32.NewProc("AttachConsole")
 )
 
+// runStart 记录进程启动时刻，用于面板上显示「已运行 xxx」——
+// 长期运行时，一个孤零零的帧数说明不了什么，配合运行时长才有意义。
+var runStart = time.Now()
+
 const (
 	stdOutputHandle                 = ^uintptr(10) // STD_OUTPUT_HANDLE == -11
 	stdErrorHandle                  = ^uintptr(11) // STD_ERROR_HANDLE  == -12
@@ -282,58 +286,105 @@ type deviceInfo struct {
 	Serial       string `json:"serial"`
 	VendorID     string `json:"vendor_id"`
 	ProductID    string `json:"product_id"`
-	Firmware     string `json:"firmware"`
+	// USBVersion 是 USB 设备描述符里的 bcdDevice（HIDD_ATTRIBUTES.VersionNumber），
+	// 例如 "1.00"。它表示 USB 接口版本，**不是固件版本**，早期版本把它当成固件显示是错的。
+	USBVersion string `json:"usb_version"`
+	// 以下三项来自私有遥测帧头，读到第一帧后才有值（见 applyVersion）。
+	Firmware string `json:"firmware"`
+	Hardware string `json:"hardware"`
+	Protocol string `json:"protocol"`
+}
+
+// deviceInfoFrom 由已打开的 HID 句柄生成设备信息。
+// 版本号中只有 USB 接口版本此时可知；固件/硬件/协议版本要等读到第一帧再补。
+func deviceInfoFrom(dev *hid.Device) deviceInfo {
+	if dev == nil {
+		return deviceInfo{
+			Manufacturer: "UGREEN", Product: "US3000",
+			Serial: "—", VendorID: "2B89", ProductID: "FFFF",
+			USBVersion: "—", Firmware: "—", Hardware: "—", Protocol: "—",
+		}
+	}
+	return deviceInfo{
+		Manufacturer: dev.Manufacturer,
+		Product:      dev.Product,
+		Serial:       dev.Serial,
+		VendorID:     fmt.Sprintf("%04X", dev.VendorID),
+		ProductID:    fmt.Sprintf("%04X", dev.ProductID),
+		USBVersion:   fmt.Sprintf("%d.%02d", dev.Version>>8, dev.Version&0xFF),
+		Firmware:     "—", Hardware: "—", Protocol: "—",
+	}
+}
+
+// applyVersion 用遥测帧头里的版本号补齐固件/硬件/协议版本。
+func (di *deviceInfo) applyVersion(v protocol.Version) {
+	if !v.Known {
+		return
+	}
+	di.Firmware = v.Firmware()
+	di.Hardware = fmt.Sprintf("V%d", v.HWVersion)
+	di.Protocol = v.Protocol()
 }
 
 type sampleJSON struct {
-	Time           string    `json:"time"`
-	Status         string    `json:"status"`
-	StatusCode     string    `json:"status_code"`
-	Online         bool      `json:"online"`
-	Charging       bool      `json:"charging"`
-	InputVoltage   float64   `json:"input_voltage_v"`
-	OutputVoltage  float64   `json:"output_voltage_v"`
-	InputCurrent   float64   `json:"input_current_a"`
-	InputPower     float64   `json:"input_power_w"`
-	BatteryVoltage float64   `json:"battery_voltage_v"`
-	ChargePercent  int       `json:"battery_charge_percent"`
-	ChargeCurrent  float64   `json:"charge_current_ma"`
-	LoadPercent    int       `json:"load_percent"`
-	LoadValid      bool      `json:"load_valid"`
-	RuntimeSec     int       `json:"runtime_seconds"`
-	RuntimeSource  string    `json:"runtime_source"`
-	Cells          []float64 `json:"cell_voltages_v"`
-	CellDeltaMv    float64   `json:"cell_delta_mv"`
-	Health         string    `json:"battery_health"`
-	RawHex         string    `json:"raw_hex,omitempty"`
+	Time           string  `json:"time"`
+	Status         string  `json:"status"`
+	StatusCode     string  `json:"status_code"`
+	Online         bool    `json:"online"`
+	Charging       bool    `json:"charging"`
+	InputVoltage   float64 `json:"input_voltage_v"`
+	OutputVoltage  float64 `json:"output_voltage_v"`
+	InputCurrent   float64 `json:"input_current_a"`
+	InputPower     float64 `json:"input_power_w"`
+	BatteryVoltage float64 `json:"battery_voltage_v"`
+	ChargePercent  int     `json:"battery_charge_percent"`
+	ChargeCurrent  float64 `json:"charge_current_ma"`
+	LoadPercent    int     `json:"load_percent"`
+	LoadValid      bool    `json:"load_valid"`
+	// 剩余运行时间：两个来源分开给出，便于对照
+	RuntimeSec       int       `json:"runtime_seconds"`        // 优先采用值（设备上报优先）
+	RuntimeSource    string    `json:"runtime_source"`         // 优先采用值的来源
+	RuntimeDeviceSec int       `json:"runtime_device_seconds"` // 设备上报值，-1 = 不可用
+	RuntimeLocalSec  int       `json:"runtime_local_seconds"`  // 本地估算值，-1 = 不可用
+	RuntimeBasis     string    `json:"runtime_basis"`          // 本地估算依据
+	LoadPowerW       float64   `json:"load_power_w"`           // 估算所用的负载功率
+	Cells            []float64 `json:"cell_voltages_v"`
+	CellDeltaMv      float64   `json:"cell_delta_mv"`
+	Health           string    `json:"battery_health"`
+	RawHex           string    `json:"raw_hex,omitempty"`
 }
 
 func newSampleJSON(s *protocol.Sample, withRaw bool) sampleJSON {
 	rt, src := s.RuntimeEstimate()
+	ri := s.Runtime()
 	cells := make([]float64, len(s.Cells))
 	for i, v := range s.Cells {
 		cells[i] = v
 	}
 	j := sampleJSON{
-		Time:           s.Time.Format(time.RFC3339),
-		Status:         s.Status,
-		StatusCode:     s.StatusShort(),
-		Online:         s.Online,
-		Charging:       s.Charging,
-		InputVoltage:   r3(s.InputVoltage),
-		OutputVoltage:  r3(s.OutputVoltage),
-		InputCurrent:   r3(s.InputCurrent),
-		InputPower:     r2(s.InputPower()),
-		BatteryVoltage: r3(s.BatteryVoltage),
-		ChargePercent:  s.ChargePercent,
-		ChargeCurrent:  s.ChargeCurrent,
-		LoadPercent:    s.LoadPercent,
-		LoadValid:      s.LoadValid,
-		RuntimeSec:     rt,
-		RuntimeSource:  src,
-		Cells:          cells,
-		CellDeltaMv:    r2(s.CellDelta()),
-		Health:         s.Health(),
+		Time:             s.Time.Format(time.RFC3339),
+		Status:           s.Status,
+		StatusCode:       s.StatusShort(),
+		Online:           s.Online,
+		Charging:         s.Charging,
+		InputVoltage:     r3(s.InputVoltage),
+		OutputVoltage:    r3(s.OutputVoltage),
+		InputCurrent:     r3(s.InputCurrent),
+		InputPower:       r2(s.InputPower()),
+		BatteryVoltage:   r3(s.BatteryVoltage),
+		ChargePercent:    s.ChargePercent,
+		ChargeCurrent:    s.ChargeCurrent,
+		LoadPercent:      s.LoadPercent,
+		LoadValid:        s.LoadValid,
+		RuntimeSec:       rt,
+		RuntimeSource:    src,
+		RuntimeDeviceSec: ri.DeviceSec,
+		RuntimeLocalSec:  ri.LocalSec,
+		RuntimeBasis:     ri.Basis,
+		LoadPowerW:       r2(s.LoadPowerW()),
+		Cells:            cells,
+		CellDeltaMv:      r2(s.CellDelta()),
+		Health:           s.Health(),
 	}
 	if withRaw {
 		j.RawHex = s.RawHex()
@@ -343,14 +394,7 @@ func newSampleJSON(s *protocol.Sample, withRaw bool) sampleJSON {
 
 func printJSON(dev *hid.Device, s *protocol.Sample) {
 	out := jsonOut{
-		Device: deviceInfo{
-			Manufacturer: dev.Manufacturer,
-			Product:      dev.Product,
-			Serial:       dev.Serial,
-			VendorID:     fmt.Sprintf("%04X", dev.VendorID),
-			ProductID:    fmt.Sprintf("%04X", dev.ProductID),
-			Firmware:     fmt.Sprintf("%d.%02d", dev.Version>>8, dev.Version&0xFF),
-		},
+		Device: deviceInfoFrom(dev),
 		Sample: newSampleJSON(s, *fRaw),
 	}
 	enc := json.NewEncoder(os.Stdout)
@@ -380,14 +424,7 @@ func runConsole(tray bool) {
 	}
 	defer dev.Close()
 
-	di := deviceInfo{
-		Manufacturer: dev.Manufacturer,
-		Product:      dev.Product,
-		Serial:       dev.Serial,
-		VendorID:     fmt.Sprintf("%04X", dev.VendorID),
-		ProductID:    fmt.Sprintf("%04X", dev.ProductID),
-		Firmware:     fmt.Sprintf("%d.%02d", dev.Version>>8, dev.Version&0xFF),
-	}
+	di := deviceInfoFrom(dev)
 
 	var cw *csv.Writer
 	var cf *os.File
@@ -444,14 +481,7 @@ func runConsole(tray bool) {
 			time.Sleep(500 * time.Millisecond)
 			if nd, e := openUPS(); e == nil {
 				dev = nd
-				di = deviceInfo{
-					Manufacturer: nd.Manufacturer,
-					Product:      nd.Product,
-					Serial:       nd.Serial,
-					VendorID:     fmt.Sprintf("%04X", nd.VendorID),
-					ProductID:    fmt.Sprintf("%04X", nd.ProductID),
-					Firmware:     fmt.Sprintf("%d.%02d", nd.Version>>8, nd.Version&0xFF),
-				}
+				di = deviceInfoFrom(nd)
 				events = append(events, fmt.Sprintf("%s 设备已重新连接", time.Now().Format("15:04:05")))
 			} else {
 				events = append(events, fmt.Sprintf("%s 读取失败: %v", time.Now().Format("15:04:05"), err))
@@ -469,6 +499,7 @@ func runConsole(tray bool) {
 		}
 		frames++
 		rateN++
+		di.applyVersion(s.Version) // 固件/硬件/协议版本来自遥测帧头
 		if elapsed := time.Since(rate).Seconds(); elapsed >= 5 {
 			fps = float64(rateN) / elapsed
 			rate, rateN = time.Now(), 0
@@ -554,6 +585,8 @@ func render(di deviceInfo, s *protocol.Sample, frames int, fps float64, events [
 		di.Product, fmt.Sprintf("VID:%s PID:%s", di.VendorID, di.ProductID),
 		di.Firmware, di.Serial)
 	b.WriteString(cReset)
+	fmt.Fprintf(&b, "  %sUSB %s  ·  硬件 %s  ·  私有协议 %s%s\n",
+		cDim, di.USBVersion, di.Hardware, di.Protocol, cReset)
 	b.WriteString(cDim + "  " + strings.Repeat("─", 76) + "\n" + cReset)
 
 	// 状态行
@@ -572,10 +605,13 @@ func render(di deviceInfo, s *protocol.Sample, frames int, fps float64, events [
 	fmt.Fprintf(&b, "  %s%s %s%s   %s[%s]%s\n",
 		statusColor, statusIcon, pad(s.Status, 34), cReset, cDim, s.StatusShort(), cReset)
 
-	fmt.Fprintf(&b, "  %s采样时间%s %s    %s第 %d 帧%s",
-		cDim, cReset, s.Time.Format("2006-01-02 15:04:05"), cDim, frames, cReset)
+	fmt.Fprintf(&b, "  %s采样时间%s %s    %s第 %s 帧%s",
+		cDim, cReset, s.Time.Format("2006-01-02 15:04:05"), cDim, fmtFrames(frames), cReset)
 	if fps > 0 {
 		fmt.Fprintf(&b, "    %s%.1f 帧/秒%s", cDim, fps, cReset)
+	}
+	if up := int(time.Since(runStart).Seconds()); up > 0 {
+		fmt.Fprintf(&b, "    %s已运行 %s%s", cDim, fmtDuration(up), cReset)
 	}
 	b.WriteString("\n\n")
 
@@ -607,15 +643,19 @@ func render(di deviceInfo, s *protocol.Sample, frames int, fps float64, events [
 		chgStr = cDim + "0 mA（未充电）" + cReset
 	}
 	kv2(&b, "充电电流", chgStr, "标称容量", "43.0 Wh")
-	rt, _ := s.RuntimeEstimate()
-	rtStr := cDim + "市电正常" + cReset
-	if rt > 0 {
-		rtStr = fmtDuration(rt)
-		if s.Mode == protocol.ModeBattery {
-			rtStr += "（设备估算）"
-		}
+	// 剩余续航：设备上报与本地估算并列（设备只在电池供电时给值）
+	ri := s.Runtime()
+	devStr := cDim + "—（需电池供电）" + cReset
+	if ri.DeviceSec > 0 {
+		devStr = fmtDuration(ri.DeviceSec)
 	}
-	kv2(&b, "预计续航", rtStr, "电池类型", "4S 锂离子")
+	localStr := cDim + "—" + cReset
+	if ri.LocalSec > 0 {
+		localStr = fmtDuration(ri.LocalSec)
+	}
+	kv2(&b, "设备续航", devStr, "本地估算", localStr)
+	fmt.Fprintf(&b, "  %s估算依据：%s%s\n", cDim, ri.Basis, cReset)
+	kv2(&b, "电池类型", "4S 锂离子", "硬件版本", di.Hardware)
 
 	// 电芯
 	b.WriteString(section("电芯电压 (4S)"))
@@ -885,20 +925,63 @@ func chargeColor(p int) string {
 	}
 }
 
+// fmtDuration 把秒数格式化为可读时长。
+// 程序按年运行也不罕见，所以超过一天要按天/年折算，别显示成 "8760 小时 0 分"。
 func fmtDuration(sec int) string {
 	if sec < 0 {
 		return "—"
 	}
-	h := sec / 3600
+	d := sec / 86400
+	h := (sec % 86400) / 3600
 	m := (sec % 3600) / 60
 	s := sec % 60
-	if h > 0 {
+	switch {
+	case d >= 365:
+		return fmt.Sprintf("%d 年 %d 天", d/365, d%365)
+	case d > 0:
+		return fmt.Sprintf("%d 天 %d 小时", d, h)
+	case h > 0:
 		return fmt.Sprintf("%d 小时 %d 分", h, m)
-	}
-	if m > 0 {
+	case m > 0:
 		return fmt.Sprintf("%d 分 %d 秒", m, s)
+	default:
+		return fmt.Sprintf("%d 秒", s)
 	}
-	return fmt.Sprintf("%d 秒", s)
+}
+
+// groupDigits 给整数加千分位（第 1234567 帧 → 1,234,567），长时间运行时更易读。
+func groupDigits(n int) string {
+	s := strconv.Itoa(n)
+	neg := strings.HasPrefix(s, "-")
+	if neg {
+		s = s[1:]
+	}
+	var sb strings.Builder
+	for i, c := range s {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteRune(c)
+	}
+	if neg {
+		return "-" + sb.String()
+	}
+	return sb.String()
+}
+
+// fmtFrames 把累计帧数格式化为适合"运行数年"的读法。
+//
+// 按 1 Hz 采样，1 亿帧约等于 3.2 年；到那个量级后 9 位数字再怎么加千分位也难一眼读出
+// 数量级，因此超过 1 亿改用「亿」，其余保持千分位精确值。程序按 64 位 int 计数，
+// 即使跑上百年也不会溢出。
+func fmtFrames(n int) string {
+	if n < 0 {
+		return "—"
+	}
+	if n >= 100000000 { // 1e8 帧 ≈ 3.17 年 @1Hz
+		return fmt.Sprintf("%.2f 亿", float64(n)/1e8)
+	}
+	return groupDigits(n)
 }
 
 // ---------------------------------------------------------------- 托盘模式：控制台查看器
@@ -927,17 +1010,17 @@ func runConsoleViewer() {
 	tick := time.NewTicker(time.Duration(*fInterval) * time.Millisecond)
 	defer tick.Stop()
 	var (
-		frames int
-		rate   = time.Now()
-		rateN  int
-		fps    float64
+		rate  = time.Now()
+		rateN int
+		fps   float64
 	)
 	for range tick.C {
-		s, di, evs, err := pollStatus()
+		// frames 直接取 Web 服务的累计帧数：它是真正的解析帧计数，
+		// 比查看器本地数轮询次数更准，也能跨越查看器重启。
+		s, di, evs, frames, err := pollStatus()
 		if err != nil || s == nil {
 			continue
 		}
-		frames++
 		rateN++
 		if elapsed := time.Since(rate).Seconds(); elapsed >= 5 {
 			fps = float64(rateN) / elapsed
@@ -960,20 +1043,20 @@ func runConsoleViewer() {
 }
 
 // pollStatus 从本地 Web 仪表盘拉取最新状态。
-func pollStatus() (*protocol.Sample, deviceInfo, []string, error) {
+func pollStatus() (*protocol.Sample, deviceInfo, []string, int, error) {
 	resp, err := http.Get(fmt.Sprintf("http://localhost:%d/api/status", gWebPort))
 	if err != nil {
-		return nil, deviceInfo{}, nil, err
+		return nil, deviceInfo{}, nil, 0, err
 	}
 	defer resp.Body.Close()
 	var sr statusResp
 	if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
-		return nil, deviceInfo{}, nil, err
+		return nil, deviceInfo{}, nil, 0, err
 	}
 	if sr.Sample == nil {
-		return nil, sr.Device, sr.Events, fmt.Errorf("设备未就绪: %s", sr.Error)
+		return nil, sr.Device, sr.Events, sr.Frames, fmt.Errorf("设备未就绪: %s", sr.Error)
 	}
-	return viewerSample(*sr.Sample), sr.Device, sr.Events, nil
+	return viewerSample(*sr.Sample), sr.Device, sr.Events, sr.Frames, nil
 }
 
 // viewerSample 将 Web 接口返回的 JSON 样本映射回 protocol.Sample，供控制台面板渲染。
@@ -992,7 +1075,9 @@ func viewerSample(sj sampleJSON) *protocol.Sample {
 		LoadPercent:    sj.LoadPercent,
 		LoadValid:      sj.LoadValid,
 		ChargePercent:  sj.ChargePercent,
-		RuntimeSec:     sj.RuntimeSec,
+		// RuntimeSec 只接受「设备上报」值：Runtime() 用它当设备上报值，
+		// 若把本地估算塞进来会被误标成固件上报，所以估算值为 -1 时这里也置 -1。
+		RuntimeSec: sj.RuntimeDeviceSec,
 	}
 	// OB 模式下 InputCurrent 即电池放电电流，供续航估算复用
 	s.BatteryCurrent = sj.InputCurrent

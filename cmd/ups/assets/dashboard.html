@@ -154,10 +154,22 @@ let primed = false;
 
 function fmtDur(sec){
   if(sec === undefined || sec === null || sec < 0) return '—';
-  const h = Math.floor(sec/3600), m = Math.floor(sec%3600/60), s = sec%60;
-  if(h>0) return h+' 小时 '+m+' 分';
-  if(m>0) return m+' 分 '+s+' 秒';
+  const d = Math.floor(sec/86400), h = Math.floor(sec%86400/3600),
+        m = Math.floor(sec%3600/60), s = sec%60;
+  if(d>=365) return Math.floor(d/365)+' 年 '+(d%365)+' 天';
+  if(d>0)     return d+' 天 '+h+' 小时';
+  if(h>0)     return h+' 小时 '+m+' 分';
+  if(m>0)     return m+' 分 '+s+' 秒';
   return s+' 秒';
+}
+
+// fmtNum 给整数加千分位。程序可连续运行数年，帧数会到千万级，不加分隔很难读；
+// 超过 1 亿帧（约 3.2 年 @1Hz）后改用「亿」，否则数字会把状态栏挤爆。
+function fmtNum(n){
+  if(n===undefined||n===null) return '—';
+  n = Number(n);
+  if(n >= 1e8) return (n/1e8).toFixed(2)+' 亿';
+  return n.toLocaleString('en-US');
 }
 
 function cardHTML(items){
@@ -202,7 +214,8 @@ function render(d){
   b.className = 'badge'+(ob?' r':(chg?' a':' g'));
   document.getElementById('metaTxt').textContent =
     'VID:'+d.device.vendor_id+' PID:'+d.device.product_id+
-    ' · 固件 '+d.device.firmware+' · SN:'+d.device.serial+' · 第 '+d.frames+' 帧';
+    ' · 固件 '+d.device.firmware+' · 硬件 '+d.device.hardware+
+    ' · SN:'+d.device.serial+' · 第 '+fmtNum(d.frames)+' 帧';
 
   // 历史
   HIST.push({t:Date.now(), inv:s.input_voltage_v, batv:s.battery_voltage_v,
@@ -225,8 +238,10 @@ function render(d){
       s:'电芯合计 '+s.cell_voltages_v.reduce((a,b)=>a+b,0).toFixed(3)+' V'},
     {k:'充电电流', v:s.charge_current_ma.toFixed(0), u:'mA',
       s:s.charging?'充电中':'未充电'},
-    {k:'剩余运行时间', v:fmtDur(s.runtime_seconds), u:'',
-      s:ob?('来源: '+s.runtime_source):'断电后预计可维持'},
+    {k:'剩余运行时间', v:fmtDur(s.runtime_local_seconds), u:'',
+      s:'本地估算 · '+s.runtime_basis},
+    {k:'设备上报续航', v:s.runtime_device_seconds>0?fmtDur(s.runtime_device_seconds):'—', u:'',
+      s:s.runtime_device_seconds>0?'固件上报值':'仅电池供电时由固件给出'},
     {k:'输出电压', v:ob?s.output_voltage_v.toFixed(3):'—', u:ob?'V':'',
       s:ob?'稳压输出':'仅电池供电时上报'},
   ]);

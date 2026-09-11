@@ -22,6 +22,46 @@ const (
 	PackCapacityWh = 43.0 // 3000mAh x 14.4V（4S 锂电，见拆解数据）
 )
 
+// 帧头版本字段的偏移（均含开头的 Report ID）。
+//
+// 设备每帧开头恒定上报 `71 03 03 01 02 02 16`，与铭牌/厂商软件标注的固件 V3.3
+// 一致，故 [1]/[2] 取作固件主/次版本。注意：USB 设备描述符里的 bcdDevice
+// （HIDD_ATTRIBUTES.VersionNumber）报的是 1.00，那是 USB 接口版本号、不是固件版本，
+// 两者不可混为一谈。
+const (
+	OffFWMajor       = 1
+	OffFWMinor       = 2
+	OffHWMajor       = 3
+	OffProtocolMajor = 4
+	OffProtocolMinor = 5
+)
+
+// Version 是设备在帧头里上报的各版本号。
+type Version struct {
+	FWMajor    int  // 固件主版本
+	FWMinor    int  // 固件次版本
+	HWVersion  int  // 硬件版本
+	ProtoMajor int  // 私有协议主版本
+	ProtoMinor int  // 私有协议次版本
+	Known      bool // 是否已从帧中解析到
+}
+
+// Firmware 返回固件版本字符串，如 "V3.3"。
+func (v Version) Firmware() string {
+	if !v.Known {
+		return "—"
+	}
+	return fmt.Sprintf("V%d.%d", v.FWMajor, v.FWMinor)
+}
+
+// Protocol 返回私有协议版本字符串，如 "2.2"。
+func (v Version) Protocol() string {
+	if !v.Known {
+		return "—"
+	}
+	return fmt.Sprintf("%d.%d", v.ProtoMajor, v.ProtoMinor)
+}
+
 // 状态字节 data[7] 的取值
 const (
 	StatusOL     byte = 0x26 // 市电供电，电池已充满
@@ -41,6 +81,8 @@ const (
 // Sample 是一帧遥测数据的解析结果
 type Sample struct {
 	Time time.Time
+
+	Version Version // 帧头里的固件/硬件/协议版本
 
 	RawStatus byte   // 原始状态字节
 	Mode      Mode   // 工作模式
@@ -83,7 +125,15 @@ func Parse(data []byte) (*Sample, error) {
 	}
 
 	s := &Sample{
-		Time:           time.Now(),
+		Time: time.Now(),
+		Version: Version{
+			FWMajor:    int(data[OffFWMajor]),
+			FWMinor:    int(data[OffFWMinor]),
+			HWVersion:  int(data[OffHWMajor]),
+			ProtoMajor: int(data[OffProtocolMajor]),
+			ProtoMinor: int(data[OffProtocolMinor]),
+			Known:      true,
+		},
 		RawStatus:      data[7],
 		InputVoltage1:  float64(beU16(data, 16)) / 1000.0,
 		BatteryVoltage: float64(beU16(data, 22)) / 1000.0,
@@ -172,24 +222,82 @@ func (s *Sample) CellSum() float64 {
 	return sum
 }
 
-// RuntimeEstimate 基于电量与当前功率估算的剩余运行时间（秒）。
-// 电池供电模式下优先采用设备上报值；市电模式下按当前功率折算。
-func (s *Sample) RuntimeEstimate() (int, string) {
+// RuntimeInfo 剩余运行时间（秒）。两个来源分开给出，便于对照：
+// 设备上报值只有在电池供电（OB）模式下才有效，本地估算则任何时候都能算。
+type RuntimeInfo struct {
+	DeviceSec int    // 设备上报，-1 = 不可用
+	LocalSec  int    // 本地估算，-1 = 无法估算
+	Basis     string // 本地估算依据（用于界面说明）
+}
+
+// Usable 返回优先采用的剩余秒数：优先设备上报，其次本地估算，都没有则 -1。
+func (r RuntimeInfo) Usable() int {
+	if r.DeviceSec > 0 {
+		return r.DeviceSec
+	}
+	return r.LocalSec
+}
+
+// Source 返回优先采用值的来源描述。
+func (r RuntimeInfo) Source() string {
+	if r.DeviceSec > 0 {
+		return "设备上报"
+	}
+	if r.LocalSec > 0 {
+		return "本地估算"
+	}
+	return "不可用"
+}
+
+// LoadPowerW 估算“市电若此刻中断，电池需要供出的功率”(W)。
+//
+//   - 电池供电：直接取输出端实测的放电功率。
+//   - 市电供电：输入功率里混着给电池充电的那部分，必须扣掉，否则会系统性低估续航。
+func (s *Sample) LoadPowerW() float64 {
 	if s.Mode == ModeBattery {
-		if s.RuntimeSec > 0 {
-			return s.RuntimeSec, "设备上报"
-		}
-		p := s.OutputVoltage * s.BatteryCurrent
-		if p > 1 {
-			return int(PackCapacityWh * float64(s.ChargePercent) / 100.0 / p * 3600.0), "按当前功率估算"
-		}
-		return -1, "功率过低，无法估算"
+		return s.OutputVoltage * s.BatteryCurrent
 	}
 	p := s.InputVoltage * s.InputCurrent
-	if p > 1 {
-		return int(PackCapacityWh * float64(s.ChargePercent) / 100.0 / p * 3600.0), "按当前功率估算"
+	if s.Charging && s.ChargeCurrent > 0 {
+		p -= s.BatteryVoltage * s.ChargeCurrent / 1000.0 // ChargeCurrent 单位 mA
 	}
-	return -1, "功率过低，无法估算"
+	if p < 0 {
+		return 0
+	}
+	return p
+}
+
+// Runtime 同时给出设备上报值与本地估算值。
+func (s *Sample) Runtime() RuntimeInfo {
+	r := RuntimeInfo{DeviceSec: -1, LocalSec: -1, Basis: "—"}
+
+	// 设备上报：仅 OB 模式下 [16-17] 是剩余秒数（市电时该字段被输入电压复用）
+	if s.Mode == ModeBattery && s.RuntimeSec > 0 {
+		r.DeviceSec = s.RuntimeSec
+	}
+
+	usableWh := PackCapacityWh * float64(s.ChargePercent) / 100.0
+	loadW := s.LoadPowerW()
+	if usableWh > 0 && loadW > 0.5 {
+		r.LocalSec = int(usableWh / loadW * 3600.0)
+		r.Basis = fmt.Sprintf("%.1f Wh 可用容量 ÷ %.2f W 负载", usableWh, loadW)
+	} else if loadW <= 0.5 {
+		r.Basis = "负载过低（<0.5 W），无法估算"
+	} else {
+		r.Basis = "电量过低，无法估算"
+	}
+	return r
+}
+
+// RuntimeEstimate 返回优先采用的剩余运行时间（秒）与来源说明。
+// 设备上报可用时用上报值，否则回退到本地估算。
+func (s *Sample) RuntimeEstimate() (int, string) {
+	r := s.Runtime()
+	n := r.Usable()
+	if n <= 0 {
+		return -1, r.Basis
+	}
+	return n, r.Source()
 }
 
 // Health 返回电池健康相关评估
