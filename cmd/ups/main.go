@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -126,6 +127,16 @@ var consolePaused int32
 var gTrayMode bool
 
 func main() {
+	logInit()
+	defer func() {
+		if r := recover(); r != nil {
+			logf("PANIC in main: %v\n%s", r, debug.Stack())
+			msgBox("UGREEN UPS Monitor 崩溃", fmt.Sprintf("%v", r))
+			os.Exit(1)
+		}
+	}()
+	logf("=== 启动 %v ===", os.Args)
+
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr,
 			"UGREEN US3000 UPS 监控工具\n\n用法:\n  %s [选项]\n\n选项:\n", os.Args[0])

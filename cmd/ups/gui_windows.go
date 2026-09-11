@@ -13,7 +13,11 @@ import (
 	"embed"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime/debug"
+	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/lxn/walk"
 	hid "ugreen-ups/hid"
@@ -22,6 +26,60 @@ import (
 
 //go:embed assets/icon.ico
 var trayIconFS embed.FS
+
+var (
+	user32          = syscall.NewLazyDLL("user32.dll")
+	procMessageBoxW = user32.NewProc("MessageBoxW")
+	logFile         *os.File
+)
+
+// logInit 打开日志文件（与可执行文件同目录，失败则退回临时目录）。
+// GUI 子系统无控制台，所有诊断信息走文件 + 弹窗。
+func logInit() {
+	path := "ups-monitor.log"
+	if exe, err := os.Executable(); err == nil {
+		path = filepath.Join(filepath.Dir(exe), "ups-monitor.log")
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		f, err = os.CreateTemp("", "ups-monitor-*.log")
+		if err != nil {
+			return
+		}
+	}
+	logFile = f
+}
+
+func logf(format string, a ...any) {
+	if logFile == nil {
+		return
+	}
+	fmt.Fprintf(logFile, time.Now().Format("2006-01-02 15:04:05.000 ")+format+"\n", a...)
+	_ = logFile.Sync()
+}
+
+// msgBox 用原生 Win32 弹窗显示错误（不依赖 walk，即使 GUI 初始化失败也能提示用户）。
+func msgBox(title, text string) {
+	t, err1 := syscall.UTF16PtrFromString(title)
+	x, err2 := syscall.UTF16PtrFromString(text)
+	if err1 != nil || err2 != nil {
+		return
+	}
+	const mbIconError = 0x00000010
+	procMessageBoxW.Call(0, uintptr(unsafe.Pointer(x)), uintptr(unsafe.Pointer(t)), mbIconError)
+}
+
+// guard 包裹 goroutine，捕获 panic 并记录 + 提示，避免静默崩溃。
+func guard(name string, f func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			logf("PANIC in %s: %v\n%s", name, r, debug.Stack())
+			msgBox("UGREEN UPS Monitor 崩溃", fmt.Sprintf("%s: %v", name, r))
+			os.Exit(1)
+		}
+	}()
+	f()
+}
 
 // guiRefs 缓存 GUI 中需要动态更新的控件引用。
 type guiRefs struct {
@@ -36,22 +94,31 @@ type guiRefs struct {
 	footer *walk.Label
 }
 
-// loadAppIcon 将内嵌的 ICO 写出到临时文件并加载为 walk 图标。
+// loadAppIcon 加载窗口/托盘图标：优先用内嵌 ICO 写出的临时文件，
+// 失败则退回 rsrc 嵌进可执行文件的图标资源（ID=1）。
 func loadAppIcon() (*walk.Icon, error) {
-	data, err := trayIconFS.ReadFile("assets/icon.ico")
-	if err != nil {
-		return nil, err
+	if data, err := trayIconFS.ReadFile("assets/icon.ico"); err == nil {
+		if f, err := os.CreateTemp("", "ups-monitor-*.ico"); err == nil {
+			if _, err := f.Write(data); err == nil {
+				f.Close()
+				if ic, err := walk.NewIconFromFile(f.Name()); err == nil {
+					return ic, nil
+				} else {
+					logf("loadAppIcon: NewIconFromFile 失败: %v", err)
+				}
+			} else {
+				f.Close()
+			}
+		}
+	} else {
+		logf("loadAppIcon: 读取内嵌图标失败: %v", err)
 	}
-	f, err := os.CreateTemp("", "ups-monitor-*.ico")
-	if err != nil {
-		return nil, err
+	if ic, err := walk.NewIconFromResourceId(1); err == nil {
+		return ic, nil
+	} else {
+		logf("loadAppIcon: 资源图标回退失败: %v", err)
 	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		return nil, err
-	}
-	f.Close()
-	return walk.NewIconFromFile(f.Name())
+	return nil, fmt.Errorf("无法加载图标")
 }
 
 // newGroup 创建一个带标题的分组框，并在其中为每组键值建立一行标签。
@@ -85,53 +152,58 @@ func newGroup(parent walk.Container, title string, keys []string) (*walk.GroupBo
 }
 
 func fatal(err error) {
-	fmt.Fprintln(os.Stderr, "致命错误:", err)
+	logf("FATAL: %v", err)
+	msgBox("UGREEN UPS Monitor 启动失败", fmt.Sprint(err))
 	os.Exit(1)
 }
 
 // runGUI 启动原生 GUI 窗口 + 系统托盘，并作为默认运行模式。
 func runGUI() {
+	logf("runGUI: start, args=%v", os.Args)
 	// 单一监控源：Web 仪表盘（不自动开浏览器，GUI 即主界面）。
 	// 端口缺省 127.0.0.1:0 —— 仅监听本机并由系统随机分配端口，避免占用固定 8080、也不对外暴露。
 	addr := *fWeb
 	if addr == "" {
 		addr = "127.0.0.1:0"
 	}
-	go runWeb(addr, true)
+	go guard("runWeb", func() { runWeb(addr, true) })
+	logf("runGUI: web monitor launched on %s", addr)
 
 	icon, iconErr := loadAppIcon()
 	if iconErr != nil {
-		fmt.Fprintln(os.Stderr, "加载图标失败（忽略）:", iconErr)
+		logf("runGUI: load icon failed (ignored): %v", iconErr)
 	}
 
 	mw, err := walk.NewMainWindow()
 	if err != nil {
 		fatal(err)
 	}
+	logf("runGUI: main window created")
 	if icon != nil {
 		_ = mw.SetIcon(icon)
 	}
 	mw.SetTitle("UGREEN US3000 UPS 监控")
+	_ = mw.SetSize(walk.Size{Width: 470, Height: 640})
 
-	root, err := walk.NewComposite(mw)
-	if err != nil {
+	// 表单自身必须有布局：walk 的 startLayout 会对表单调用 CreateLayoutItemsForContainer，
+	// 表单无布局时 ContainerBase.CreateLayoutItem 会解引用 nil layout 而 panic。
+	if err := mw.SetLayout(walk.NewVBoxLayout()); err != nil {
 		fatal(err)
 	}
-	root.SetLayout(walk.NewVBoxLayout())
 
-	status, err := walk.NewLabel(root)
+	status, err := walk.NewLabel(mw)
 	if err != nil {
 		fatal(err)
 	}
 	status.SetText("正在连接 UPS…")
 
-	dev, err := walk.NewLabel(root)
+	dev, err := walk.NewLabel(mw)
 	if err != nil {
 		fatal(err)
 	}
 	dev.SetText("UGREEN US3000")
 
-	socRow, err := walk.NewComposite(root)
+	socRow, err := walk.NewComposite(mw)
 	if err != nil {
 		fatal(err)
 	}
@@ -152,24 +224,24 @@ func runGUI() {
 	}
 	socTxt.SetText("—")
 
-	_, power := newGroup(root, "电力",
+	_, power := newGroup(mw, "电力",
 		[]string{"输入电压", "输入电流", "输入功率", "负载"})
-	_, batt := newGroup(root, "电池",
+	_, batt := newGroup(mw, "电池",
 		[]string{"电池电压", "电芯合计", "充电电流", "预计续航", "均衡"})
 
-	cells, err := walk.NewLabel(root)
+	cells, err := walk.NewLabel(mw)
 	if err != nil {
 		fatal(err)
 	}
 	cells.SetText("电芯: —")
 
-	prot, err := walk.NewLabel(root)
+	prot, err := walk.NewLabel(mw)
 	if err != nil {
 		fatal(err)
 	}
 	prot.SetText("低电量自动保护: —")
 
-	footer, err := walk.NewLabel(root)
+	footer, err := walk.NewLabel(mw)
 	if err != nil {
 		fatal(err)
 	}
@@ -190,7 +262,7 @@ func runGUI() {
 	// 某些无桌面的环境（如服务器会话）无法创建托盘图标，此时降级为仅窗口+Web，不致命退出。
 	ni, niErr := walk.NewNotifyIcon(mw)
 	if niErr != nil {
-		fmt.Fprintln(os.Stderr, "警告: 无法创建系统托盘图标（环境可能无桌面）:", niErr)
+		logf("警告: 无法创建系统托盘图标（环境可能无桌面）: %v", niErr)
 	} else {
 		if icon != nil {
 			_ = ni.SetIcon(icon)
@@ -216,10 +288,11 @@ func runGUI() {
 		_ = ni.ContextMenu().Actions().Add(aGUI)
 		_ = ni.ContextMenu().Actions().Add(aQuit)
 		_ = ni.SetVisible(true)
+		logf("托盘图标已创建（菜单：打开 Web 页面 / 打开 GUI / 退出）")
 	}
 
 	// 定时轮询监控数据并更新界面
-	go func() {
+	go guard("poll", func() {
 		tick := time.NewTicker(time.Duration(*fInterval) * time.Millisecond)
 		defer tick.Stop()
 		for range tick.C {
@@ -232,10 +305,12 @@ func runGUI() {
 				refs.update(snapshot, devInfo, pollErr)
 			})
 		}
-	}()
+	})
 
+	logf("runGUI: entering message loop")
 	mw.Show()
 	mw.Run()
+	logf("runGUI: message loop exited (this should only happen on quit)")
 }
 
 // update 将最新样本刷新到 GUI 控件（必须在 UI 线程调用，外部用 Synchronize 包住）。
@@ -308,12 +383,11 @@ func runListGUI() {
 		fatal(err)
 	}
 	mw.SetTitle("HID 设备列表")
-	root, err := walk.NewComposite(mw)
-	if err != nil {
+	_ = mw.SetSize(walk.Size{Width: 760, Height: 480})
+	if err := mw.SetLayout(walk.NewVBoxLayout()); err != nil {
 		fatal(err)
 	}
-	root.SetLayout(walk.NewVBoxLayout())
-	te, err := walk.NewTextEdit(root)
+	te, err := walk.NewTextEdit(mw)
 	if err != nil {
 		fatal(err)
 	}

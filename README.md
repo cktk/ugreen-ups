@@ -38,6 +38,7 @@ ups-monitor.exe -list
 - **点击窗口关闭按钮 → 最小化到托盘继续运行**（不退出）。需要再次查看时，右键托盘图标选「打开 GUI」。
 - 右键托盘图标有三个菜单项：**打开 Web 页面**（浏览器打开内嵌仪表盘）、**打开 GUI**（重新显示窗口）、**退出**（停止监控并退出）。
 - **Web 端口每次启动随机**（绑定 `127.0.0.1`，仅本机可访问，不会占用固定的 8080）；「打开 Web 页面」始终指向本次实际端口。
+- **诊断**：GUI 程序没有控制台，启动步骤与错误会写入**与可执行文件同目录**的 `ups-monitor.log`；发生崩溃时还会弹出错误对话框（不依赖 GUI 库，确保能看到原因）。
 
 ## 截图
 
@@ -145,9 +146,11 @@ Windows 会将 COL02 识别为"HID UPS 电池"，这是正常现象。本程序�
 ugreen-ups/
 ├── cmd/ups/              主程序
 │   ├── main.go           入口、终端面板、JSON 输出、低电量保护接线
-│   ├── gui_windows.go    Go 原生 GUI 窗口 + 系统托盘（lxn/walk）
+│   ├── gui_windows.go    Go 原生 GUI 窗口 + 系统托盘（lxn/walk）+ 崩溃日志
 │   ├── power_windows.go  低电量保护状态机、电源动作、开机自启
 │   ├── web.go            HTTP 服务与采集器（单一监控源）
+│   ├── app.manifest      应用程序清单（Common Controls 6.0 + DPI 感知）
+│   ├── rsrc.syso         清单 + 图标资源（由 rsrc 生成，编译时自动链接）
 │   └── assets/
 │       ├── dashboard.html  Web 仪表盘（内嵌，无外部 CDN 依赖）
 │       └── icon.ico        托盘/窗口图标（内嵌）
@@ -187,7 +190,20 @@ go build -ldflags "-H windowsgui" -o ups-monitor.exe ./cmd/ups/
 ```
 
 > `-ldflags "-H windowsgui"` 将程序编译为 **GUI 子系统**，运行时不出现 cmd 控制台窗口。
-> 若去掉该参数则编译为控制台程序，默认走终端面板（开发调试用）。
+> 若去掉该参数则编译为控制台程序（不会自动出现 GUI 窗口，但 `-console` / `-once` 可直接在 cmd 中使用）。
+
+**为什么必须有 `cmd/ups/rsrc.syso`**：GUI 基于的 `lxn/walk` 依赖 **Common Controls 6.0**，
+可执行文件必须携带应用程序清单（manifest），否则创建窗口会失败——典型表现为
+`TTM_ADDTOOL failed` 或「双击运行立刻闪退」。仓库已包含由 `cmd/ups/app.manifest` 生成的
+`cmd/ups/rsrc.syso`（内含清单 + 图标资源），Go 链接器会自动链接同目录下的 `*.syso`，
+因此直接 `go build` 即可，无需额外步骤。
+
+修改清单或图标后需重新生成：
+
+```bash
+go run github.com/akavel/rsrc@latest \
+  -manifest cmd/ups/app.manifest -ico cmd/ups/assets/icon.ico -arch amd64 -o cmd/ups/rsrc.syso
+```
 
 要求 Go 1.20+，仅支持 Windows（依赖 Win32 HID API）。国内网络建议：
 
