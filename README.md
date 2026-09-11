@@ -1,6 +1,8 @@
 # UGREEN US3000 UPS 监控工具
 
-通过 USB HID 直接读取绿联 UGREEN US3000 UPS 遥测数据的 Go 程序。**纯 Go 实现，零第三方依赖、无需 cgo、无需安装任何驱动或厂商软件。**
+通过 USB HID 直接读取绿联 UGREEN US3000 UPS 遥测数据的 Go 程序。**纯 Go 实现、无需 cgo、无需安装任何驱动或厂商软件。**
+
+界面为 **Go 原生 GUI 窗口 + 系统托盘**（基于纯 Go 的 [`lxn/walk`](https://github.com/lxn/walk)，同样不依赖 cgo，不再是 cmd 控制台窗口）；同时内置 **Web 仪表盘**，便于手机或其他设备查看。
 
 设备标识：`VID:2B89 PID:FFFF`，固件 `V3.3`（对外报告版本 1.00）。
 
@@ -9,20 +11,33 @@
 ## 快速开始
 
 ```bash
-# 终端实时面板（默认，每秒刷新）
+# 启动原生 GUI 窗口 + 系统托盘（默认）
 ups-monitor.exe
 
-# 启动 Web 仪表盘并自动打开浏览器
-ups-monitor.exe -web :8080
+# 仅后台运行 Web 服务，无窗口/托盘（端口随机、仅本机可访问）
+ups-monitor.exe -tray=false
 
-# 读取一次并以 JSON 输出（便于脚本集成）
+# 指定 Web 端口（默认每次启动随机）
+ups-monitor.exe -web 127.0.0.1:9000
+
+# 终端实时面板（需从 cmd 等控制台窗口启动）
+ups-monitor.exe -console
+
+# 读取一次并以 JSON 输出（便于脚本集成，支持 > file 重定向）
 ups-monitor.exe -once -json
 
-# 列出系统中所有 HID 设备（排查连接问题时使用）
+# 列出系统中所有 HID 设备（以 GUI 窗口展示）
 ups-monitor.exe -list
 ```
 
-> 若控制台中文显示异常，程序已自动切换到 UTF-8 代码页；如仍异常可手动执行 `chcp 65001`。
+> 程序以 GUI 子系统编译（无控制台窗口）。双击即出现 GUI 窗口并常驻托盘；`-console` / `-once -json` 会自动接回启动它的控制台。
+
+## GUI 窗口与系统托盘
+
+- 启动后显示 Go 原生 GUI 窗口，实时展示状态、电力、电池、电芯与低电量保护配置，约每秒刷新。
+- **点击窗口关闭按钮 → 最小化到托盘继续运行**（不退出）。需要再次查看时，右键托盘图标选「打开 GUI」。
+- 右键托盘图标有三个菜单项：**打开 Web 页面**（浏览器打开内嵌仪表盘）、**打开 GUI**（重新显示窗口）、**退出**（停止监控并退出）。
+- **Web 端口每次启动随机**（绑定 `127.0.0.1`，仅本机可访问，不会占用固定的 8080）；「打开 Web 页面」始终指向本次实际端口。
 
 ## 截图
 
@@ -42,14 +57,16 @@ ups-monitor.exe -list
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `-web <addr>` | 无 | 启动 Web 仪表盘，如 `-web :8080`；启动后自动打开浏览器 |
+| `-tray` | true | `true`=GUI 窗口 + 系统托盘（默认）；`false`=仅后台 Web 服务，无窗口/托盘 |
+| `-console` | false | 以终端实时面板运行（需从 cmd 等控制台窗口启动） |
+| `-web <addr>` | 随机 | 指定 Web 仪表盘监听地址（如 `-web 127.0.0.1:9000`）；缺省时随机端口且仅监听本机 |
+| `-no-browser` | false | 不自动打开浏览器 |
 | `-once` | false | 只读取一帧即退出 |
-| `-json` | false | 以 JSON 格式输出（配合 `-once` 或持续输出） |
-| `-list` | false | 枚举系统中所有 HID 接口及其 UsagePage |
-| `-csv <file>` | 无 | 同时将每帧数据追加写入 CSV 文件 |
+| `-json` | false | 以 JSON 格式输出（配合 `-once`） |
+| `-list` | false | 以 GUI 窗口枚举系统中所有 HID 接口及其 UsagePage |
+| `-csv <file>` | 无 | 同时将每帧数据追加写入 CSV 文件（终端面板模式） |
 | `-raw` | false | 额外输出原始帧的十六进制 |
 | `-i <ms>` | 1000 | 采样间隔（毫秒） |
-| `-no-browser` | false | Web 模式下不自动打开浏览器 |
 | `-low <n>` | 0 | 电量低于该百分比时自动执行电源动作（0=关闭，范围 1–100） |
 | `-action <a>` | shutdown | 低电量动作：`shutdown`(关机) / `sleep`(睡眠) / `hibernate`(休眠) |
 
@@ -127,10 +144,13 @@ Windows 会将 COL02 识别为"HID UPS 电池"，这是正常现象。本程序�
 ```
 ugreen-ups/
 ├── cmd/ups/              主程序
-│   ├── main.go           入口、终端面板、JSON 输出
-│   ├── web.go            HTTP 服务与采集器
+│   ├── main.go           入口、终端面板、JSON 输出、低电量保护接线
+│   ├── gui_windows.go    Go 原生 GUI 窗口 + 系统托盘（lxn/walk）
+│   ├── power_windows.go  低电量保护状态机、电源动作、开机自启
+│   ├── web.go            HTTP 服务与采集器（单一监控源）
 │   └── assets/
-│       └── dashboard.html  Web 仪表盘（内嵌，无外部 CDN 依赖）
+│       ├── dashboard.html  Web 仪表盘（内嵌，无外部 CDN 依赖）
+│       └── icon.ico        托盘/窗口图标（内嵌）
 ├── hid/                   Windows HID 驱动（纯 syscall，无 cgo）
 │   └── hid.go             setupapi / hid.dll / kernel32 封装
 ├── protocol/              协议解析
@@ -162,8 +182,12 @@ go run ./sample -n 120 -i 1000        # 采样 2 分钟，输出逐字节统计�
 ## 编译
 
 ```bash
-go build -o ups-monitor.exe ./cmd/ups/
+# 编译为 GUI 程序（无控制台窗口，默认）
+go build -ldflags "-H windowsgui" -o ups-monitor.exe ./cmd/ups/
 ```
+
+> `-ldflags "-H windowsgui"` 将程序编译为 **GUI 子系统**，运行时不出现 cmd 控制台窗口。
+> 若去掉该参数则编译为控制台程序，默认走终端面板（开发调试用）。
 
 要求 Go 1.20+，仅支持 Windows（依赖 Win32 HID API）。国内网络建议：
 
@@ -240,6 +264,7 @@ Web 仪表盘底部新增"低电量自动保护"卡片：勾选启用、填写�
 
 ## 更新日志
 
+- **原生 GUI + 系统托盘**：改用 Go 原生 GUI 窗口（纯 Go 的 `lxn/walk`，非 cmd 控制台），默认以 GUI 子系统编译（无控制台窗口）；关闭窗口最小化到托盘继续运行，右键托盘图标可选「打开 Web 页面」「打开 GUI」「退出」；Web 端口每次启动随机且仅监听本机；终端面板改由 `-console` 显式启用。
 - **交互式低电量配置**：新增终端设置菜单（运行中输入 `c` 进入）与 Web 仪表盘设置卡片，可随时修改"电量阈值 / 动作（关机·睡眠·休眠·仅提示）/ 启用禁用"，并持久化到 `ups-monitor.json`；启动参数 `-low`/`-action` 仍可在首次运行时覆盖并回写。详见 [低电量自动保护](#低电量自动保护)。
 - **低电量自动保护**：市电中断、仅靠电池供电时，按阈值自动关机 / 睡眠 / 休眠（仅电池模式触发，连续 3 帧确认，单次触发）。
 - **基础监控**：通过 USB HID 直读 UGREEN US3000 遥测，提供终端实时面板 / JSON 输出 / Web 仪表盘三种用法，纯 Go 实现、零第三方依赖、免驱动。

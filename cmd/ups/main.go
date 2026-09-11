@@ -35,13 +35,38 @@ var (
 	procGetConsoleMode     = k32.NewProc("GetConsoleMode")
 	procSetConsoleMode     = k32.NewProc("SetConsoleMode")
 	procGetStdHandle       = k32.NewProc("GetStdHandle")
+	procAttachConsole      = k32.NewProc("AttachConsole")
 )
 
 const (
 	stdOutputHandle                 = ^uintptr(10) // STD_OUTPUT_HANDLE == -11
+	stdErrorHandle                  = ^uintptr(11) // STD_ERROR_HANDLE  == -12
+	invalidHandleValue              = ^uintptr(0)  // INVALID_HANDLE_VALUE == -1
 	enableVirtualTerminalProcessing = 0x0004
 	cpUTF8                          = 65001
+	attachParentProcess             = ^uintptr(0) // ATTACH_PARENT_PROCESS == -1
 )
+
+// attachParentConsole 让 GUI 子系统程序把标准输出接回启动它的控制台，
+// 使 -once / -json / -console 在 cmd 中运行时可正常打印。
+//
+// 关键：仅当标准句柄本身无效（GUI 程序从 cmd 启动时的默认状态）才重定向到 CONOUT$，
+// 以免破坏 `>` 文件重定向与管道（此时句柄有效，必须保持原样）。
+func attachParentConsole() {
+	if r, _, _ := procAttachConsole.Call(attachParentProcess); r == 0 {
+		return // 无父控制台（如双击运行），保持原样
+	}
+	if h, _, _ := procGetStdHandle.Call(stdOutputHandle); h == 0 || h == invalidHandleValue {
+		if out, err := os.OpenFile("CONOUT$", os.O_WRONLY, 0); err == nil {
+			os.Stdout = out
+		}
+	}
+	if h, _, _ := procGetStdHandle.Call(stdErrorHandle); h == 0 || h == invalidHandleValue {
+		if out, err := os.OpenFile("CONOUT$", os.O_WRONLY, 0); err == nil {
+			os.Stderr = out
+		}
+	}
+}
 
 // initConsole 启用 UTF-8 输出与 ANSI 转义序列支持。
 func initConsole() {
@@ -83,7 +108,8 @@ var (
 	fQuiet    = flag.Bool("q", false, "静默模式，不打印表头")
 
 	fNoBrowser = flag.Bool("no-browser", false, "Web 模式下不自动打开浏览器")
-	fTray      = flag.Bool("tray", true, "显示系统托盘图标；关闭控制台窗口时最小化到托盘继续运行")
+	fTray      = flag.Bool("tray", true, "true=GUI 窗口+系统托盘（默认）；false=仅后台 Web 服务")
+	fConsole   = flag.Bool("console", false, "以终端实时面板运行（需从控制台窗口启动）")
 
 	// 低电量自动保护
 	fLow    = flag.Int("low", 0, "电量低于此百分比时触发电源动作（0=关闭，范围 1-100）")
@@ -152,22 +178,34 @@ func main() {
 	initConsole()
 
 	if *fList {
-		listDevices()
+		runListGUI()
 		return
 	}
-	if *fTray {
-		runTray()
+	if *fConsole {
+		// 终端实时面板（需从 cmd 等控制台启动）
+		attachParentConsole()
+		initConsole()
+		runConsole(false)
 		return
 	}
-	if *fWeb != "" {
-		runWeb(*fWeb, *fNoBrowser)
+	if !*fTray {
+		// 无 GUI/托盘：仅运行 Web 监控服务（适合服务器或无界面环境）。
+		// 端口缺省为 127.0.0.1:0（仅本机、系统随机分配），避免固定占用 8080。
+		addr := *fWeb
+		if addr == "" {
+			addr = "127.0.0.1:0"
+		}
+		runWeb(addr, *fNoBrowser)
 		return
 	}
 	if *fOnce {
+		// 单次 JSON/文本输出，接回父控制台以便在 cmd 中查看
+		attachParentConsole()
+		initConsole()
 		runOnce()
 		return
 	}
-	runConsole(false)
+	runGUI()
 }
 
 // openUPS 连接 UPS 的私有遥测接口。
@@ -648,10 +686,6 @@ func stdinLoop() {
 		case "c", "config", "C":
 			configMenu(r)
 		case "q", "Q":
-			if gTrayMode {
-				trayQuit()
-				return
-			}
 			fmt.Println("\n收到退出指令，正在停止…")
 			os.Exit(0)
 		}
