@@ -117,6 +117,7 @@ func main() {
 	set := map[string]bool{}
 	flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
 	low, action := *fLow, *fAction
+	var autostart bool
 	if set["low"] || set["action"] {
 		switch action {
 		case "shutdown", "sleep", "hibernate", "none":
@@ -125,13 +126,22 @@ func main() {
 			os.Exit(2)
 		}
 		gLowBattery = newLowBatteryGuard(low, action)
-		if err := saveConfig(AppConfig{Low: low, Action: action}); err != nil {
+		if ec, ok := loadConfig(); ok {
+			autostart = ec.Autostart // 保留已配置的开机自启
+		}
+		if err := saveConfig(AppConfig{Low: low, Action: action, Autostart: autostart}); err != nil {
 			fmt.Fprintf(os.Stderr, "警告: 保存配置失败: %v\n", err)
 		}
 	} else if cfg, ok := loadConfig(); ok {
 		gLowBattery = newLowBatteryGuard(cfg.Low, cfg.Action)
+		autostart = cfg.Autostart
 	} else {
 		gLowBattery = newLowBatteryGuard(low, action)
+	}
+	gAutostart.Store(autostart)
+	// 开机自启：将配置同步到注册表 Run 键（断电恢复后自动重新运行监控）
+	if err := setAutostart(gAutostart.Load()); err != nil {
+		fmt.Fprintf(os.Stderr, "警告: 设置开机自启失败: %v\n", err)
 	}
 
 	initConsole()
@@ -562,6 +572,11 @@ func render(dev *hid.Device, s *protocol.Sample, frames int, fps float64, events
 			dot = cGreen + "●" + cReset
 		}
 		fmt.Fprintf(&b, "  %s %s%s%s\n", dot, cBold, status, cReset)
+		asState := cDim + "已禁用" + cReset
+		if gAutostart.Load() {
+			asState = cGreen + "已启用" + cReset
+		}
+		fmt.Fprintf(&b, "  %s开机自启%s %s\n", cDim, cReset, asState)
 	}
 
 	// 事件
@@ -607,6 +622,7 @@ func configMenu(r *bufio.Reader) {
 	defer atomic.StoreInt32(&consolePaused, 0)
 	fmt.Print("\033[2J\033[H")
 
+	as := gAutostart.Load()
 	for {
 		en, low, act := gLowBattery.Snapshot()
 		fmt.Printf("\n%s低电量自动保护 · 设置%s\n\n", cBold+cCyan, cReset)
@@ -614,11 +630,13 @@ func configMenu(r *bufio.Reader) {
 		if en {
 			status = fmt.Sprintf("已启用（电量 < %d%% 时 %s）", low, actionName(act))
 		}
-		fmt.Printf("  当前状态: %s%s%s\n\n", cBold, status, cReset)
+		fmt.Printf("  当前状态: %s%s%s\n", cBold, status, cReset)
+		fmt.Printf("  开机自启: %s%s%s\n\n", cBold, map[bool]string{true: "已启用", false: "已禁用"}[as], cReset)
 		fmt.Printf("  %s1%s) 修改电量阈值（当前 %d%%）\n", cGreen, cReset, low)
 		fmt.Printf("  %s2%s) 修改动作（当前 %s）\n", cGreen, cReset, actionName(act))
 		fmt.Printf("  %s3%s) %s保护\n", cGreen, cReset, map[bool]string{true: "禁用", false: "启用"}[en])
-		fmt.Printf("  %s4%s) 保存并返回\n", cGreen, cReset)
+		fmt.Printf("  %s4%s) %s开机自启（当前 %s）\n", cGreen, cReset, map[bool]string{true: "禁用", false: "启用"}[as], map[bool]string{true: "已启用", false: "已禁用"}[as])
+		fmt.Printf("  %s5%s) 保存并返回\n", cGreen, cReset)
 		fmt.Printf("  %sq%s) 不保存退出\n\n", cYellow, cReset)
 		fmt.Printf("  请选择: ")
 
@@ -672,13 +690,24 @@ func configMenu(r *bufio.Reader) {
 			}
 			time.Sleep(700 * time.Millisecond)
 		case "4":
+			as = !as
+			fmt.Printf("  %s开机自启已%s%s\n", cGreen, map[bool]string{true: "启用", false: "禁用"}[as], cReset)
+			time.Sleep(700 * time.Millisecond)
+		case "5":
 			_, low2, act2 := gLowBattery.Snapshot()
-			if err := saveConfig(AppConfig{Low: low2, Action: act2}); err != nil {
+			if err := saveConfig(AppConfig{Low: low2, Action: act2, Autostart: as}); err != nil {
 				fmt.Printf("  %s保存失败: %v%s\n", cRed, err, cReset)
 				time.Sleep(900 * time.Millisecond)
 				continue
 			}
-			fmt.Printf("  %s已保存到 %s%s\n", cGreen, configPath, cReset)
+			gAutostart.Store(as)
+			if err := setAutostart(as); err != nil {
+				fmt.Printf("  %s注册表写入失败: %v%s\n", cRed, err, cReset)
+				time.Sleep(900 * time.Millisecond)
+				continue
+			}
+			fmt.Printf("  %s已保存到 %s（开机自启：%s）%s\n", cGreen, configPath,
+				map[bool]string{true: "已启用", false: "已禁用"}[as], cReset)
 			time.Sleep(700 * time.Millisecond)
 			fmt.Print("\033[2J\033[H")
 			return

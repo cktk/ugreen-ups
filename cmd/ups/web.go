@@ -270,7 +270,7 @@ func (m *monitor) handleStatus(w http.ResponseWriter, r *http.Request) {
 		ServerAt: time.Now().Format(time.RFC3339),
 	}
 	en, low, act := gLowBattery.Snapshot()
-	p.Config = map[string]interface{}{"enabled": en, "low": low, "action": act}
+	p.Config = map[string]interface{}{"enabled": en, "low": low, "action": act, "autostart": gAutostart.Load()}
 	if m.latest != nil {
 		j := newSampleJSON(m.latest, false)
 		p.Sample = &j
@@ -303,16 +303,18 @@ func (m *monitor) handleConfig(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		en, low, act := gLowBattery.Snapshot()
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"enabled": en,
-			"low":     low,
-			"action":  act,
-			"actions": []string{"shutdown", "sleep", "hibernate", "none"},
-			"path":    configPath,
+			"enabled":   en,
+			"low":       low,
+			"action":    act,
+			"autostart": gAutostart.Load(),
+			"actions":   []string{"shutdown", "sleep", "hibernate", "none"},
+			"path":      configPath,
 		})
 	case http.MethodPost, http.MethodPut:
 		var req struct {
-			Low    int    `json:"low"`
-			Action string `json:"action"`
+			Low       int    `json:"low"`
+			Action    string `json:"action"`
+			Autostart bool   `json:"autostart"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
@@ -333,16 +335,23 @@ func (m *monitor) handleConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		en := req.Low > 0
 		gLowBattery.Configure(en, req.Low, req.Action)
-		if err := saveConfig(AppConfig{Low: req.Low, Action: req.Action}); err != nil {
+		gAutostart.Store(req.Autostart)
+		if err := saveConfig(AppConfig{Low: req.Low, Action: req.Action, Autostart: req.Autostart}); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(map[string]string{"error": "保存配置失败: " + err.Error()})
 			return
 		}
+		if err := setAutostart(req.Autostart); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "注册表开机自启写入失败: " + err.Error()})
+			return
+		}
 		en2, low2, act2 := gLowBattery.Snapshot()
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"enabled": en2,
-			"low":     low2,
-			"action":  act2,
+			"enabled":   en2,
+			"low":       low2,
+			"action":    act2,
+			"autostart": gAutostart.Load(),
 		})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)

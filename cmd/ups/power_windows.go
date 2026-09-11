@@ -15,7 +15,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"ugreen-ups/protocol"
@@ -25,8 +27,55 @@ import (
 
 // AppConfig 是低电量保护的持久化配置。
 type AppConfig struct {
-	Low    int    `json:"low"`    // 电量阈值，0 表示禁用
-	Action string `json:"action"` // shutdown / sleep / hibernate / none
+	Low       int    `json:"low"`       // 电量阈值，0 表示禁用
+	Action    string `json:"action"`    // shutdown / sleep / hibernate / none
+	Autostart bool   `json:"autostart"` // 是否开机自启（写入注册表 Run 键）
+}
+
+// gAutostart 反映当前开机自启状态，与注册表 Run 键保持一致。
+// 由终端菜单与 Web 接口并发读写，故使用 atomic.Bool。
+var gAutostart atomic.Bool
+
+// ---------------------------------------------------------------- 开机自启
+
+const (
+	// runKeyPath 为当前用户开机自启注册表项（无需管理员权限）。
+	runKeyPath   = `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+	runValueName = "UGREEN UPS Monitor"
+)
+
+// buildAutostartCmdline 生成开机自启使用的命令行：默认启动 Web 仪表盘
+// （断电恢复后便于在浏览器查看状态并继续保护）。若本次即以 -web 启动，则沿用该参数。
+func buildAutostartCmdline() string {
+	exe, err := os.Executable()
+	if err != nil {
+		exe = "ups-monitor.exe"
+	}
+	args := os.Args[1:]
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-web" && i+1 < len(args) {
+			return fmt.Sprintf(`"%s" -web %s`, exe, args[i+1])
+		}
+		if strings.HasPrefix(args[i], "-web=") {
+			return fmt.Sprintf(`"%s" %s`, exe, args[i])
+		}
+	}
+	return fmt.Sprintf(`"%s" -web :8080`, exe)
+}
+
+// setAutostart 通过 Windows 注册表 Run 键启用/禁用开机自启。
+// 启用时写入命令行；禁用时删除键值（不存在也不视为错误）。
+func setAutostart(enable bool) error {
+	if enable {
+		cmd := buildAutostartCmdline()
+		if cmd == "" {
+			return fmt.Errorf("无法确定可执行文件路径")
+		}
+		return exec.Command("reg", "add", runKeyPath,
+			"/v", runValueName, "/t", "REG_SZ", "/d", cmd, "/f").Run()
+	}
+	_ = exec.Command("reg", "delete", runKeyPath, "/v", runValueName, "/f").Run()
+	return nil
 }
 
 // configPath 为配置文件路径（与可执行文件同目录）。

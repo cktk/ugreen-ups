@@ -138,6 +138,9 @@
       <button id="cfgSave">保存</button>
       <span id="cfgMsg" class="cfg-msg"></span>
     </div>
+    <div class="cfg-row" style="margin-top:10px">
+      <label><input type="checkbox" id="cfgAuto"> 开机自启（断电恢复后自动运行监控）</label>
+    </div>
     <div class="s" id="cfgPath" style="margin-top:8px"></div>
   </div>
 
@@ -357,6 +360,7 @@ async function loadConfig(){
     document.getElementById('cfgEn').checked = c.enabled;
     document.getElementById('cfgLow').value = c.low || '';
     if(c.action) document.getElementById('cfgAction').value = c.action;
+    document.getElementById('cfgAuto').checked = !!c.autostart;
     document.getElementById('cfgPath').textContent = '配置文件: ' + (c.path||'');
   }catch(e){}
 }
@@ -367,14 +371,14 @@ document.getElementById('cfgSave').addEventListener('click', async ()=>{
   const low = parseInt(document.getElementById('cfgLow').value, 10);
   const action = document.getElementById('cfgAction').value;
   const en = document.getElementById('cfgEn').checked;
-  const payload = { low: en ? (isNaN(low)?0:low) : 0, action };
+  const payload = { low: en ? (isNaN(low)?0:low) : 0, action, autostart: document.getElementById('cfgAuto').checked };
   try{
     const r = await fetch('/api/config',{method:'POST',
       headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
     if(!r.ok){ const e = await r.json().catch(()=>({error:r.statusText}));
       msg.className='cfg-msg err'; msg.textContent='保存失败: '+(e.error||r.status); return; }
     const c = await r.json();
-    msg.textContent = '已保存：电量低于 '+c.low+'% 时 '+actionLabel(c.action);
+    msg.textContent = '已保存：电量低于 '+c.low+'% 时 '+actionLabel(c.action)+(c.autostart?' · 开机自启已启用':' · 开机自启已禁用');
     loadConfig();
   }catch(e){ msg.className='cfg-msg err'; msg.textContent='请求失败: '+e; }
 });
