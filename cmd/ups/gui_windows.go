@@ -205,10 +205,14 @@ func endRow(r walk.Container) {
 	}
 }
 
-// leftAlignCheckBox 把复选框的文字改为左对齐。
-// Windows 的 BS_AUTOCHECKBOX 在多出空白时会居中绘制文字，walk 未暴露该样式位，直接改样式。
-func leftAlignCheckBox(cb *walk.CheckBox) {
-	h := cb.Handle()
+// leftAlignButton 把复选框/单选按钮的文字改为左对齐。
+// Windows 的 BS_AUTOCHECKBOX / BS_AUTORADIOBUTTON 在多出空白时会居中绘制文字，
+// walk 未暴露该样式位，直接改样式。
+func leftAlignButton(b interface {
+	Handle() win.HWND
+	Invalidate() error
+}) {
+	h := b.Handle()
 	if h == 0 {
 		return
 	}
@@ -216,7 +220,7 @@ func leftAlignCheckBox(cb *walk.CheckBox) {
 	win.SetWindowLong(h, win.GWL_STYLE, style|win.BS_LEFT)
 	win.SetWindowPos(h, 0, 0, 0, 0, 0,
 		win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOZORDER|win.SWP_FRAMECHANGED)
-	cb.Invalidate()
+	_ = b.Invalidate()
 }
 
 // fixedWidth 把控件宽度固定为 96dpi 下的 w（walk 的 SetMinMaxSize 中 max 为 0 表示不限制）。
@@ -355,13 +359,305 @@ func (b *bannerWidget) paint(cv *walk.Canvas, f uiFonts) {
 		walk.Rectangle{X: rightX, Y: sc(54), Width: rightW, Height: sc(20)}, fr)
 }
 
+// ---------------------------------------------------------------- 电芯电压图表
+
+// 图表在 96dpi 下的分段高度（自上而下）：
+//
+//	0            .. barValueH              柱顶电压数值标注
+//	barValueH    .. barBottom              柱体
+//	barBottom    .. barAxisH               电芯编号
+//	+gap                                  分隔
+//	trendTop     .. cellChartHeight        压差历史折线
+const (
+	cellChartHeight = 118
+	barValueH       = 14
+	barBodyH        = 46
+	barAxisH        = 15
+	cellChartGap    = 7
+	trendLabelW     = 40
+)
+
+// cellChart 自绘“电芯电压柱状图 + 压差历史折线”。
+//
+//   - 柱状图：4 节电芯电压，柱高按当前 4 节的最小/最大值自适应放大（至少 20mV 量程），
+//     柱顶连折线以直观呈现均衡程度，并画出平均电压虚线。
+//   - 折线图：从 /api/history 取回的压差（最大−最小）序列，展示均衡性的变化趋势。
+//
+// 颜色取自系统主题色（COLOR_WINDOWTEXT / COLOR_GRAYTEXT），浅色与深色主题下都可读。
+type cellChart struct {
+	cw    *walk.CustomWidget
+	cells [4]float64
+	ok    bool
+	trend []float64 // 压差序列，单位 mV
+}
+
+func newCellChart(parent walk.Container, f uiFonts) *cellChart {
+	c := &cellChart{}
+	cw, err := walk.NewCustomWidget(parent, 0, func(cv *walk.Canvas, _ walk.Rectangle) error {
+		c.paint(cv, f)
+		return nil
+	})
+	if err != nil {
+		fatal(err)
+	}
+	_ = cw.SetMinMaxSize(walk.Size{Width: 200, Height: cellChartHeight}, walk.Size{Height: cellChartHeight})
+	c.cw = cw
+	return c
+}
+
+func (c *cellChart) setCells(cells [4]float64) {
+	c.cells, c.ok = cells, true
+	if c.cw != nil {
+		c.cw.Invalidate()
+	}
+}
+
+func (c *cellChart) setTrend(v []float64) {
+	c.trend = v
+	if c.cw != nil {
+		c.cw.Invalidate()
+	}
+}
+
+// clear 回到“等待设备数据”占位状态。
+func (c *cellChart) clear() {
+	c.ok = false
+	if c.cw != nil {
+		c.cw.Invalidate()
+	}
+}
+
+// invalidate 标记需要重绘（必须在 UI 线程调用）。
+func (c *cellChart) invalidate() {
+	if c.cw != nil {
+		c.cw.Invalidate()
+	}
+}
+
+// gfx 收集一帧绘制期间创建的 GDI 对象，绘制结束时统一释放，避免句柄泄漏。
+type gfx struct {
+	brushes []*walk.SolidColorBrush
+	pens    []*walk.GeometricPen
+}
+
+func (g *gfx) brush(c walk.Color) *walk.SolidColorBrush {
+	b, err := walk.NewSolidColorBrush(c)
+	if err != nil {
+		return nil
+	}
+	g.brushes = append(g.brushes, b)
+	return b
+}
+
+// pen 返回一支实线几何笔；width96 以 1/96 英寸为单位，由 walk 按 DPI 自动放大。
+func (g *gfx) pen(c walk.Color, width96 int) *walk.GeometricPen {
+	br := g.brush(c)
+	if br == nil {
+		return nil
+	}
+	p, err := walk.NewGeometricPen(walk.PenSolid, width96, br)
+	if err != nil {
+		return nil
+	}
+	g.pens = append(g.pens, p)
+	return p
+}
+
+func (g *gfx) release() {
+	for _, p := range g.pens {
+		p.Dispose()
+	}
+	for _, b := range g.brushes {
+		b.Dispose()
+	}
+}
+
+func (c *cellChart) paint(cv *walk.Canvas, f uiFonts) {
+	bounds := c.cw.ClientBoundsPixels()
+	if bounds.Width < 120 || bounds.Height < 60 {
+		return
+	}
+	dpi := cv.DPI()
+	sc := func(v int) int { return v * dpi / 96 }
+
+	colText := walk.Color(win.GetSysColor(win.COLOR_WINDOWTEXT))
+	colDim := walk.Color(win.GetSysColor(win.COLOR_GRAYTEXT))
+	colBar := walk.RGB(0x4A, 0x90, 0xD9)
+	colBarMin := walk.RGB(0xE0, 0x9A, 0x3C)
+	colLine := walk.RGB(0xE8, 0x71, 0x3C)
+	colTrend := walk.RGB(0x7B, 0x61, 0xD6)
+
+	smallF := nz(f.small, f.normal)
+
+	if !c.ok {
+		drawText(cv, "等待设备数据…", nz(f.normal), colDim,
+			walk.Rectangle{X: sc(8), Y: 0, Width: bounds.Width - sc(16), Height: bounds.Height},
+			walk.TextSingleLine|walk.TextVCenter|walk.TextLeft)
+		return
+	}
+
+	g := &gfx{}
+	defer g.release()
+
+	// ---------------- 柱状图：4 节电芯电压 ----------------
+	minV, maxV := c.cells[0], c.cells[0]
+	for _, v := range c.cells {
+		if v < minV {
+			minV = v
+		}
+		if v > maxV {
+			maxV = v
+		}
+	}
+	mid := (minV + maxV) / 2
+	span := maxV - minV
+	if span < 0.020 { // 量程下限 20mV：4 节完全一致时柱子也不会贴顶
+		span = 0.020
+	}
+	yMin, yMax := mid-span/2, mid+span/2
+
+	left := sc(6)
+	right := bounds.Width - sc(6)
+	segW := (right - left) / len(c.cells)
+	if segW <= 0 {
+		return
+	}
+	barBottom := sc(barValueH + barBodyH)
+	barMaxH := sc(barBodyH)
+	barW := segW / 2
+	if barW > sc(44) {
+		barW = sc(44)
+	}
+
+	barBrush := g.brush(colBar)
+	minBrush := g.brush(colBarMin)
+
+	// 平均电压参考线（手工虚线，只依赖 PS_SOLID，最稳）
+	if ap := g.pen(colDim, 1); ap != nil {
+		avgY := barBottom - int((mid-yMin)/(yMax-yMin)*float64(barMaxH))
+		for x := left; x < right; x += sc(10) {
+			end := x + sc(6)
+			if end > right {
+				end = right
+			}
+			_ = cv.DrawLinePixels(ap, walk.Point{X: x, Y: avgY}, walk.Point{X: end, Y: avgY})
+		}
+	}
+
+	tops := make([]walk.Point, 0, len(c.cells))
+	for i, v := range c.cells {
+		cx := left + i*segW + segW/2
+		h := int((v - yMin) / (yMax - yMin) * float64(barMaxH))
+		if h < sc(2) {
+			h = sc(2)
+		}
+		br := barBrush
+		if v == minV && maxV-minV > 0.0005 { // 最低的一节用暖色标出，一眼看出短板
+			br = minBrush
+		}
+		if br != nil {
+			_ = cv.FillRectanglePixels(br, walk.Rectangle{
+				X: cx - barW/2, Y: barBottom - h, Width: barW, Height: h,
+			})
+		}
+
+		top := walk.Point{X: cx, Y: barBottom - h}
+		tops = append(tops, top)
+
+		drawText(cv, fmt.Sprintf("%.3f", v), smallF, colText,
+			walk.Rectangle{X: cx - segW/2, Y: top.Y - sc(barValueH), Width: segW, Height: sc(barValueH)},
+			walk.TextSingleLine|walk.TextVCenter|walk.TextCenter)
+		drawText(cv, fmt.Sprintf("#%d", i+1), smallF, colDim,
+			walk.Rectangle{X: cx - segW/2, Y: barBottom + sc(1), Width: segW, Height: sc(barAxisH)},
+			walk.TextSingleLine|walk.TextVCenter|walk.TextCenter)
+	}
+
+	// 柱顶折线：越平直说明 4 节越均衡
+	if lp := g.pen(colLine, 2); lp != nil && len(tops) > 1 {
+		_ = cv.DrawPolylinePixels(lp, tops)
+	}
+
+	// ---------------- 折线图：压差随时间的变化 ----------------
+	trendTop := sc(barValueH + barBodyH + barAxisH + cellChartGap)
+	trendBot := bounds.Height - sc(1)
+	if trendBot-trendTop < sc(28) {
+		return
+	}
+
+	drawText(cv, "压差", smallF, colDim,
+		walk.Rectangle{X: sc(2), Y: trendTop, Width: sc(trendLabelW), Height: trendBot - trendTop},
+		walk.TextSingleLine|walk.TextVCenter|walk.TextLeft)
+
+	infoW := sc(70)
+	tx0 := sc(trendLabelW) + sc(2)
+	tx1 := bounds.Width - infoW - sc(4)
+	ty0 := trendTop + sc(2)
+	ty1 := trendBot - sc(3)
+
+	if bp := g.pen(colDim, 1); bp != nil && tx1 > tx0 {
+		_ = cv.DrawLinePixels(bp, walk.Point{X: tx0, Y: ty1}, walk.Point{X: tx1, Y: ty1})
+	}
+
+	if len(c.trend) < 2 || tx1 <= tx0 || ty1 <= ty0 {
+		drawText(cv, "正在积累趋势数据…", smallF, colDim,
+			walk.Rectangle{X: tx0, Y: ty0, Width: tx1 - tx0, Height: ty1 - ty0},
+			walk.TextSingleLine|walk.TextVCenter|walk.TextLeft)
+		return
+	}
+
+	tMax, tMin := c.trend[0], c.trend[0]
+	for _, d := range c.trend {
+		if d > tMax {
+			tMax = d
+		}
+		if d < tMin {
+			tMin = d
+		}
+	}
+	rng := tMax - tMin
+	if rng < 4 { // 量程下限 4mV：完全平直时折线不会贴边
+		rng = 4
+	}
+	lo, hi := tMin-rng*0.15, tMax+rng*0.15
+
+	if hp := g.pen(colTrend, 2); hp != nil {
+		n := len(c.trend)
+		pts := make([]walk.Point, 0, n)
+		for i, d := range c.trend {
+			pts = append(pts, walk.Point{
+				X: tx0 + (tx1-tx0)*i/(n-1),
+				Y: ty1 - int((d-lo)/(hi-lo)*float64(ty1-ty0)),
+			})
+		}
+		_ = cv.DrawPolylinePixels(hp, pts)
+	}
+
+	// 右侧三行：当前 / 历史最大 / 历史最小
+	lineH := (ty1 - ty0) / 3
+	const rightAlign = walk.TextSingleLine | walk.TextVCenter | walk.TextRight
+	rows := []struct {
+		text string
+		col  walk.Color
+	}{
+		{fmt.Sprintf("当前 %.0f mV", c.trend[len(c.trend)-1]), colTrend},
+		{fmt.Sprintf("最大 %.0f mV", tMax), colText},
+		{fmt.Sprintf("最小 %.0f mV", tMin), colText},
+	}
+	for i, r := range rows {
+		drawText(cv, r.text, smallF, r.col,
+			walk.Rectangle{X: bounds.Width - infoW, Y: ty0 + i*lineH, Width: infoW - sc(4), Height: lineH},
+			rightAlign)
+	}
+}
+
 // ---------------------------------------------------------------- 配置读写（经 Web 接口）
 
 var (
 	actionKeys   = []string{"shutdown", "sleep", "hibernate", "none"}
-	actionLabels = []string{"关机", "睡眠", "休眠", "仅提示（不执行操作）"}
+	actionLabels = []string{"关机", "睡眠", "休眠", "仅提示"}
 )
 
+// actionIndex 返回动作在 actionKeys 中的下标（未知动作按第一个处理）。
 func actionIndex(a string) int {
 	for i, k := range actionKeys {
 		if k == a {
@@ -369,6 +665,77 @@ func actionIndex(a string) int {
 		}
 	}
 	return 0
+}
+
+// checkedActionIndex 返回当前选中的触发动作下标；异常情况下回退到第一项。
+func checkedActionIndex(rs []*walk.RadioButton) int {
+	for i, rb := range rs {
+		if rb != nil && rb.Checked() {
+			return i
+		}
+	}
+	return 0
+}
+
+// setCheckedAction 按 actionKeys 下标选中对应单选项。
+func setCheckedAction(rs []*walk.RadioButton, idx int) {
+	if idx < 0 || idx >= len(rs) {
+		return
+	}
+	for i, rb := range rs {
+		if rb != nil {
+			rb.SetChecked(i == idx)
+		}
+	}
+}
+
+// waitWebReady 等待 Web 仪表盘完成端口绑定。
+// Web 服务与 GUI 同时启动，而监听端口是系统随机分配的：在 gWebPort 被写入实际端口之前
+// 发起的请求会打到旧的默认端口上，因此首次请求前必须等一下。
+func waitWebReady(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if gWebBound {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false
+}
+
+// fetchCellTrend 取最近 n 个采样点，换算成压差序列（单位 mV）。
+// 返回结构复用 web.go 中的 historyPoint（同 package）。
+func fetchCellTrend(n int) ([]float64, error) {
+	resp, err := http.Get(fmt.Sprintf("http://localhost:%d/api/history?limit=%d", gWebPort, n))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	var pts []historyPoint
+	if err := json.NewDecoder(resp.Body).Decode(&pts); err != nil {
+		return nil, err
+	}
+	out := make([]float64, 0, len(pts))
+	for _, p := range pts {
+		cs := [4]float64{p.C1, p.C2, p.C3, p.C4}
+		mn, mx := cs[0], cs[0]
+		for _, v := range cs {
+			if v < mn {
+				mn = v
+			}
+			if v > mx {
+				mx = v
+			}
+		}
+		if mn <= 0 { // 无效样本跳过
+			continue
+		}
+		out = append(out, (mx-mn)*1000)
+	}
+	return out, nil
 }
 
 type cfgResp struct {
@@ -426,16 +793,16 @@ type guiRefs struct {
 	socBar  *walk.ProgressBar
 	socTxt  *walk.Label
 	v       map[string]*walk.Label // 各指标值标签（按中文键索引）
-	cells   *walk.Label
-	cellSub *walk.Label
+	chart   *cellChart             // 电芯电压柱状图 + 压差历史折线
+	cellSum *walk.Label            // 电芯合计量值（图表下方补充说明）
 	footer  *walk.Label
 
 	// 低电量保护设置控件
-	cfgMsg    *walk.Label
-	cbEnable  *walk.CheckBox
-	neLow     *walk.NumberEdit
-	cboAction *walk.ComboBox
-	cbAuto    *walk.CheckBox
+	cfgMsg   *walk.Label
+	cbEnable *walk.CheckBox
+	neLow    *walk.NumberEdit
+	radios   []*walk.RadioButton // 触发动作单选组（按 actionKeys 顺序）
+	cbAuto   *walk.CheckBox
 }
 
 // loadAppIcon 加载窗口/托盘图标：优先用内嵌 ICO 写出的临时文件，
@@ -552,10 +919,10 @@ func runGUI() {
 	vals["输入功率"], vals["负载"] = vInW, vLoad
 
 	// ---- 电芯 ----
-	cellGb := group(mw, "电芯电压（4S 串联）", f)
-	cellLbl := lbl(cellGb, "—", nz(f.normal))
-	deltaLbl := lbl(cellGb, "—", nz(f.small, f.normal))
-	endRow(cellGb) // 让该分组也横向撑满（纯标签分组本身不“可增长”）
+	cellGb := group(mw, "电芯电压（4S 串联） · 柱状图 + 压差折线", f)
+	chart := newCellChart(cellGb, f)
+	cellSumLbl := lbl(cellGb, "—", nz(f.normal))
+	endRow(cellGb) // 让该分组也横向撑满（自绘控件本身不“可增长”）
 
 	// ---- 低电量自动保护（可编辑）----
 	cfgGb := group(mw, "低电量自动保护 · 设置", f)
@@ -567,7 +934,7 @@ func runGUI() {
 	}
 	_ = cbEnable.SetText("启用低电量保护（仅电池供电、电量连续低于阈值时触发）")
 	setF(cbEnable, nz(f.bold, f.normal))
-	leftAlignCheckBox(cbEnable)
+	leftAlignButton(cbEnable)
 	endRow(cbRow)
 
 	lowRow := row(cfgGb)
@@ -585,18 +952,30 @@ func runGUI() {
 	_ = lbl(lowRow, "%（建议 20–30）", nz(f.small, f.normal))
 	endRow(lowRow)
 
+	// 触发动作：用单选按钮替代下拉框 —— 下拉列表在部分远程/高 DPI 环境下弹出即收起，
+	// 这里改成常驻可见的单选项，一眼看全所有可选动作，也不再需要展开-选择两步操作。
 	actRow := row(cfgGb)
 	actKey := lbl(actRow, "触发动作", nz(f.bold, f.normal))
 	_ = actKey.SetMinMaxSize(walk.Size{Width: keyColWidth}, walk.Size{})
-	cboAction, err := walk.NewComboBox(actRow)
-	if err != nil {
-		fatal(err)
+	// 连续创建 → walk 自动把它们并入同一个 RadioButtonGroup（互斥）
+	radios := make([]*walk.RadioButton, 0, len(actionLabels))
+	for i, name := range actionLabels {
+		rb, err := walk.NewRadioButton(actRow)
+		if err != nil {
+			fatal(err)
+		}
+		_ = rb.SetText(name)
+		setF(rb, nz(f.normal))
+		rb.SetChecked(i == 0)
+		radios = append(radios, rb)
 	}
-	_ = cboAction.SetModel(actionLabels)
-	_ = cboAction.SetCurrentIndex(0)
-	fixedWidth(cboAction, 168)
-	setF(cboAction, nz(f.normal))
 	endRow(actRow)
+
+	actHintRow := row(cfgGb)
+	actHintPad := lbl(actHintRow, "", nz(f.small, f.normal))
+	_ = actHintPad.SetMinMaxSize(walk.Size{Width: keyColWidth}, walk.Size{})
+	_ = lbl(actHintRow, "关机 / 睡眠 / 休眠：调用系统电源操作；“仅提示”只写日志、不执行任何操作。", nz(f.small, f.normal))
+	endRow(actHintRow)
 
 	autoRow := row(cfgGb)
 	cbAuto, err := walk.NewCheckBox(autoRow)
@@ -605,7 +984,7 @@ func runGUI() {
 	}
 	_ = cbAuto.SetText("开机自启（随 Windows 启动监控）")
 	setF(cbAuto, nz(f.normal))
-	leftAlignCheckBox(cbAuto)
+	leftAlignButton(cbAuto)
 	endRow(autoRow)
 
 	btnRow := row(cfgGb)
@@ -633,8 +1012,8 @@ func runGUI() {
 
 	refs := &guiRefs{
 		banner: bn, dev: devLbl, socBar: socBar, socTxt: socTxt,
-		v: vals, cells: cellLbl, cellSub: deltaLbl, footer: footerLbl,
-		cfgMsg: cfgMsg, cbEnable: cbEnable, neLow: neLow, cboAction: cboAction, cbAuto: cbAuto,
+		v: vals, chart: chart, cellSum: cellSumLbl, footer: footerLbl,
+		cfgMsg: cfgMsg, cbEnable: cbEnable, neLow: neLow, radios: radios, cbAuto: cbAuto,
 	}
 	_ = pathLbl
 
@@ -642,7 +1021,9 @@ func runGUI() {
 	syncEnable := func() {
 		on := cbEnable.Checked()
 		neLow.SetEnabled(on)
-		cboAction.SetEnabled(on)
+		for _, rb := range radios {
+			rb.SetEnabled(on)
+		}
 	}
 	cbEnable.CheckedChanged().Attach(syncEnable)
 
@@ -655,7 +1036,7 @@ func runGUI() {
 		if low > 100 {
 			low = 100
 		}
-		idx := cboAction.CurrentIndex()
+		idx := checkedActionIndex(radios)
 		if idx < 0 || idx >= len(actionKeys) {
 			idx = 0
 		}
@@ -734,7 +1115,7 @@ func runGUI() {
 					low = 20 // 未启用时给个默认阈值，便于直接勾选启用
 				}
 				_ = refs.neLow.SetValue(float64(low))
-				_ = refs.cboAction.SetCurrentIndex(actionIndex(c.Action))
+				setCheckedAction(refs.radios, actionIndex(c.Action))
 				refs.cbAuto.SetChecked(c.Autostart)
 				if c.Enabled {
 					refs.cfgMsg.SetText("已加载当前配置")
@@ -762,6 +1143,30 @@ func runGUI() {
 		}
 	})
 
+	// 压差历史趋势：低频单独轮询 /api/history（取最近 N 点算压差序列），
+	// 供图表下半部分的折线使用；与状态轮询解耦，互不影响刷新节奏。
+	go guard("trend", func() {
+		const trendPoints = 150 // 约最近 2.5 分钟（采样 1Hz）
+		waitWebReady(20 * time.Second)
+		tick := time.NewTicker(5 * time.Second)
+		defer tick.Stop()
+		loggedErr := false
+		for {
+			if v, err := fetchCellTrend(trendPoints); err == nil && len(v) > 0 {
+				tr := v
+				mw.Synchronize(func() {
+					if refs.chart != nil {
+						refs.chart.setTrend(tr)
+					}
+				})
+			} else if err != nil && !loggedErr {
+				loggedErr = true // 只在首次失败时记录，避免日志刷屏
+				logf("fetchCellTrend 失败（后续不再重复记录）: %v", err)
+			}
+			<-tick.C
+		}
+	})
+
 	logf("runGUI: entering message loop")
 	mw.Show()
 	mw.Run()
@@ -779,8 +1184,10 @@ func (r *guiRefs) update(s *protocol.Sample, di deviceInfo, connErr error) {
 		r.dev.SetText("请检查 UPS 的 USB 数据线是否已连接：" + di.Product)
 		r.socTxt.SetText("—")
 		r.socBar.SetValue(0)
-		r.cells.SetText("—")
-		r.cellDelta("—")
+		if r.chart != nil {
+			r.chart.clear()
+		}
+		r.setCellSum("—")
 		return
 	}
 
@@ -823,15 +1230,17 @@ func (r *guiRefs) update(s *protocol.Sample, di deviceInfo, connErr error) {
 		set("负载", "—")
 	}
 
-	r.cells.SetText(fmt.Sprintf("电芯 1–4：%.3f / %.3f / %.3f / %.3f V",
-		s.Cells[0], s.Cells[1], s.Cells[2], s.Cells[3]))
-	r.cellDelta(fmt.Sprintf("最大压差 %.0f mV  ·  4 节串联合计 %.3f V", s.CellDelta(), s.CellSum()))
+	if r.chart != nil {
+		r.chart.setCells([4]float64{s.Cells[0], s.Cells[1], s.Cells[2], s.Cells[3]})
+	}
+	r.setCellSum(fmt.Sprintf("4 节串联合计 %.3f V  ·  当前压差 %.0f mV  ·  均衡评估：%s",
+		s.CellSum(), s.CellDelta(), s.Health()))
 }
 
-// cellDelta 更新电芯分组下方的小字（guiRefs.cells 存的是主行标签，这里复用 dev 之外的子标签）。
-func (r *guiRefs) cellDelta(text string) {
-	if r.cellSub != nil {
-		_ = r.cellSub.SetText(text)
+// setCellSum 更新电芯图表下方的一行补充说明。
+func (r *guiRefs) setCellSum(text string) {
+	if r.cellSum != nil {
+		_ = r.cellSum.SetText(text)
 	}
 }
 

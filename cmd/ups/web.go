@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +27,9 @@ var dashboardFS embed.FS
 var (
 	gDashboardURL = "http://localhost:8080/"
 	gWebPort      = 8080
+	// gWebBound 表示监听套接字已建立、gWebPort 已是真实端口。
+	// 端口可能是系统随机分配的（-web 127.0.0.1:0），在它写入之前发起请求会打到默认端口上。
+	gWebBound bool
 )
 
 // onWebReady 在 Web 仪表盘完成监听后被调用，参数为实际地址（含随机端口）。
@@ -252,6 +256,7 @@ func runWeb(addr string, noBrowser bool) {
 	url := fmt.Sprintf("http://localhost:%d/", portOf(ln.Addr()))
 	gWebPort = portOf(ln.Addr())
 	gDashboardURL = url
+	gWebBound = true
 	// GUI 子系统下 stdout 不可见，由 GUI 侧注册钩子把实际监听地址写进日志文件。
 	if onWebReady != nil {
 		onWebReady(url)
@@ -312,12 +317,12 @@ func (m *monitor) handleStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 
 	type payload struct {
-		Device   deviceInfo            `json:"device"`
-		Sample   *sampleJSON           `json:"sample"`
-		Frames   int                   `json:"frames"`
-		Events   []string              `json:"events"`
-		Error    string                `json:"error,omitempty"`
-		ServerAt string                `json:"server_time"`
+		Device   deviceInfo             `json:"device"`
+		Sample   *sampleJSON            `json:"sample"`
+		Frames   int                    `json:"frames"`
+		Events   []string               `json:"events"`
+		Error    string                 `json:"error,omitempty"`
+		ServerAt string                 `json:"server_time"`
 		Config   map[string]interface{} `json:"config"`
 	}
 	p := payload{
@@ -345,6 +350,12 @@ func (m *monitor) handleHistory(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	out := m.history
+	// ?limit=N 只返回最近 N 个点（默认全部），供 GUI 画趋势图时避免整段传输与解析。
+	if s := r.URL.Query().Get("limit"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 && n < len(out) {
+			out = out[len(out)-n:]
+		}
+	}
 	if out == nil {
 		out = []historyPoint{}
 	}
