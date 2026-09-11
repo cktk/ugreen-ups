@@ -28,6 +28,10 @@ var (
 	gWebPort      = 8080
 )
 
+// onWebReady 在 Web 仪表盘完成监听后被调用，参数为实际地址（含随机端口）。
+// 仅由 GUI 模式设置，用于把地址写入日志文件；控制台模式保持 nil。
+var onWebReady func(url string)
+
 // ---------------------------------------------------------------- 采集器
 
 type historyPoint struct {
@@ -248,6 +252,10 @@ func runWeb(addr string, noBrowser bool) {
 	url := fmt.Sprintf("http://localhost:%d/", portOf(ln.Addr()))
 	gWebPort = portOf(ln.Addr())
 	gDashboardURL = url
+	// GUI 子系统下 stdout 不可见，由 GUI 侧注册钩子把实际监听地址写进日志文件。
+	if onWebReady != nil {
+		onWebReady(url)
+	}
 	fmt.Printf("%s UGREEN US3000 UPS 仪表盘已启动 %s\n", cBold+cGreen, cReset)
 	fmt.Printf("  设备:   %s %s (序列号 %s, 固件 %s)\n",
 		m.info.Manufacturer, m.info.Product, m.info.Serial, m.info.Firmware)

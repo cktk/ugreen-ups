@@ -5,6 +5,9 @@ ups-monitor
 # Runtime config (user-editable low-battery settings, not source-controlled)
 ups-monitor.json
 
+# Runtime log (GUI mode writes diagnostics here)
+ups-monitor.log
+
 # Go test / coverage output
 *.test
 *.out

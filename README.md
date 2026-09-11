@@ -160,8 +160,15 @@ ugreen-ups/
 │   └── protocol.go        64 字节帧解码
 ├── probe/                 诊断工具：枚举设备、读取用法能力与原始报告
 ├── sample/                诊断工具：长时采样并统计逐字节变化
+├── tools/uicheck/         GUI 自检脚本（纯 Python 标准库，无需第三方依赖）
+│   ├── screenshot.py      截取 GUI 窗口为 PNG（用于在无人工干预时核对界面）
+│   └── dump_window.py     导出窗口/控件树（类名、客户区坐标、文本），排查布局问题
 └── ups-monitor.exe        编译产物
 ```
+
+> `tools/uicheck` 需要在程序运行时执行，且应在仓库根目录下用目标 Python 运行，例如
+> `python tools/uicheck/screenshot.py`（输出 `ui_shot.png`）。
+> 两个脚本都会先声明 DPI 感知——否则 Windows 的 DPI 虚拟化会让截图与坐标失真。
 
 ### 为什么不用现成的 HID 库
 
