@@ -8,6 +8,9 @@ ups-monitor.json
 # Runtime log (GUI mode writes diagnostics here)
 ups-monitor.log
 
+# tools/uicheck screenshot output
+ui_shot.png
+
 # Go test / coverage output
 *.test
 *.out
