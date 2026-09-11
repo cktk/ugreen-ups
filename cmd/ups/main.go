@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -82,6 +83,7 @@ var (
 	fQuiet    = flag.Bool("q", false, "静默模式，不打印表头")
 
 	fNoBrowser = flag.Bool("no-browser", false, "Web 模式下不自动打开浏览器")
+	fTray      = flag.Bool("tray", true, "显示系统托盘图标；关闭控制台窗口时最小化到托盘继续运行")
 
 	// 低电量自动保护
 	fLow    = flag.Int("low", 0, "电量低于此百分比时触发电源动作（0=关闭，范围 1-100）")
@@ -93,6 +95,9 @@ var gLowBattery *lowBatteryGuard
 
 // consolePaused 在终端配置菜单期间为 1，暂停面板刷新与保护评估。
 var consolePaused int32
+
+// gTrayMode 标记当前是否以托盘模式运行（影响退出键行为）。
+var gTrayMode bool
 
 func main() {
 	flag.Usage = func() {
@@ -150,15 +155,19 @@ func main() {
 		listDevices()
 		return
 	}
+	if *fTray {
+		runTray()
+		return
+	}
 	if *fWeb != "" {
-		runWeb(*fWeb)
+		runWeb(*fWeb, *fNoBrowser)
 		return
 	}
 	if *fOnce {
 		runOnce()
 		return
 	}
-	runConsole()
+	runConsole(false)
 }
 
 // openUPS 连接 UPS 的私有遥测接口。
@@ -305,7 +314,15 @@ func r2(v float64) float64 { return float64(int(v*100+0.5)) / 100 }
 
 // ---------------------------------------------------------------- 终端实时面板
 
-func runConsole() {
+// runConsole 终端实时面板。
+// tray=true 时作为查看器轮询 Web 仪表盘（不占用第二个 UPS 句柄，单一监控源由 runWeb 负责）；
+// tray=false 时独立打开 UPS 句柄采样。
+func runConsole(tray bool) {
+	if tray {
+		runConsoleViewer()
+		return
+	}
+
 	dev, err := openUPS()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s连接 UPS 失败: %v%s\n", cRed, err, cReset)
@@ -313,6 +330,15 @@ func runConsole() {
 		os.Exit(1)
 	}
 	defer dev.Close()
+
+	di := deviceInfo{
+		Manufacturer: dev.Manufacturer,
+		Product:      dev.Product,
+		Serial:       dev.Serial,
+		VendorID:     fmt.Sprintf("%04X", dev.VendorID),
+		ProductID:    fmt.Sprintf("%04X", dev.ProductID),
+		Firmware:     fmt.Sprintf("%d.%02d", dev.Version>>8, dev.Version&0xFF),
+	}
 
 	var cw *csv.Writer
 	var cf *os.File
@@ -369,6 +395,14 @@ func runConsole() {
 			time.Sleep(500 * time.Millisecond)
 			if nd, e := openUPS(); e == nil {
 				dev = nd
+				di = deviceInfo{
+					Manufacturer: nd.Manufacturer,
+					Product:      nd.Product,
+					Serial:       nd.Serial,
+					VendorID:     fmt.Sprintf("%04X", nd.VendorID),
+					ProductID:    fmt.Sprintf("%04X", nd.ProductID),
+					Firmware:     fmt.Sprintf("%d.%02d", nd.Version>>8, nd.Version&0xFF),
+				}
 				events = append(events, fmt.Sprintf("%s 设备已重新连接", time.Now().Format("15:04:05")))
 			} else {
 				events = append(events, fmt.Sprintf("%s 读取失败: %v", time.Now().Format("15:04:05"), err))
@@ -441,7 +475,7 @@ func runConsole() {
 				if cw != nil {
 					cw.Flush()
 				}
-				render(dev, s, frames, fps, events)
+				render(di, s, frames, fps, events)
 				_ = powerAction(*fAction)
 				return
 			}
@@ -453,13 +487,13 @@ func runConsole() {
 			continue
 		}
 
-		render(dev, s, frames, fps, events)
+		render(di, s, frames, fps, events)
 	}
 }
 
 // ---------------------------------------------------------------- 渲染
 
-func render(dev *hid.Device, s *protocol.Sample, frames int, fps float64, events []string) {
+func render(di deviceInfo, s *protocol.Sample, frames int, fps float64, events []string) {
 	var b strings.Builder
 	b.WriteString("\033[H\033[2J") // 归位并清屏
 
@@ -467,9 +501,9 @@ func render(dev *hid.Device, s *protocol.Sample, frames int, fps float64, events
 	b.WriteString(cBold + cCyan)
 	b.WriteString("  UGREEN US3000 UPS 实时监控")
 	b.WriteString(cReset + cDim)
-	fmt.Fprintf(&b, "                      %s %s  固件 %d.%02d  序列号 %s\n",
-		dev.Product, fmt.Sprintf("VID:%04X PID:%04X", dev.VendorID, dev.ProductID),
-		dev.Version>>8, dev.Version&0xFF, dev.Serial)
+	fmt.Fprintf(&b, "                      %s %s  固件 %s  序列号 %s\n",
+		di.Product, fmt.Sprintf("VID:%s PID:%s", di.VendorID, di.ProductID),
+		di.Firmware, di.Serial)
 	b.WriteString(cReset)
 	b.WriteString(cDim + "  " + strings.Repeat("─", 76) + "\n" + cReset)
 
@@ -592,7 +626,11 @@ func render(dev *hid.Device, s *protocol.Sample, frames int, fps float64, events
 		fmt.Fprintf(&b, "  %s%s%s\n", cDim, s.RawHex(), cReset)
 	}
 
-	b.WriteString("\n  " + cDim + "按 c 进入设置 · Ctrl+C 退出" + cReset + "\n")
+	if gTrayMode {
+		b.WriteString("\n  " + cDim + "按 c 进入设置 · 关闭窗口将最小化到托盘 · 右键托盘图标可退出/打开界面" + cReset + "\n")
+	} else {
+		b.WriteString("\n  " + cDim + "按 c 进入设置 · Ctrl+C 退出" + cReset + "\n")
+	}
 	fmt.Print(b.String())
 }
 
@@ -610,6 +648,10 @@ func stdinLoop() {
 		case "c", "config", "C":
 			configMenu(r)
 		case "q", "Q":
+			if gTrayMode {
+				trayQuit()
+				return
+			}
 			fmt.Println("\n收到退出指令，正在停止…")
 			os.Exit(0)
 		}
@@ -812,4 +854,125 @@ func fmtDuration(sec int) string {
 		return fmt.Sprintf("%d 分 %d 秒", m, s)
 	}
 	return fmt.Sprintf("%d 秒", s)
+}
+
+// ---------------------------------------------------------------- 托盘模式：控制台查看器
+
+// statusResp 对应 Web 接口 /api/status 的响应结构。
+type statusResp struct {
+	Device deviceInfo  `json:"device"`
+	Sample *sampleJSON `json:"sample"`
+	Frames int         `json:"frames"`
+	Events []string    `json:"events"`
+	Error  string      `json:"error"`
+}
+
+// 与协议层状态字节对应的取值，用于将 Web 返回的紧凑状态码还原为 RawStatus。
+const (
+	vStatusOL     byte = 0x26
+	vStatusOLCHRG byte = 0x36
+	vStatusOB     byte = 0x21
+)
+
+// runConsoleViewer 在托盘模式下轮询 Web 仪表盘，渲染与独立模式一致的控制台面板。
+// 不打开自己的 UPS 句柄，避免与 Web 监控争用设备（单一监控源由 runWeb 负责）。
+func runConsoleViewer() {
+	go stdinLoop()
+
+	tick := time.NewTicker(time.Duration(*fInterval) * time.Millisecond)
+	defer tick.Stop()
+	var (
+		frames int
+		rate   = time.Now()
+		rateN  int
+		fps    float64
+	)
+	for range tick.C {
+		s, di, evs, err := pollStatus()
+		if err != nil || s == nil {
+			continue
+		}
+		frames++
+		rateN++
+		if elapsed := time.Since(rate).Seconds(); elapsed >= 5 {
+			fps = float64(rateN) / elapsed
+			rate, rateN = time.Now(), 0
+		}
+		events := evs
+		if len(events) > 6 {
+			events = events[len(events)-6:]
+		}
+		if atomic.LoadInt32(&consolePaused) != 0 {
+			continue
+		}
+		if *fJSON {
+			b, _ := json.Marshal(newSampleJSON(s, *fRaw))
+			fmt.Println(string(b))
+			continue
+		}
+		render(di, s, frames, fps, events)
+	}
+}
+
+// pollStatus 从本地 Web 仪表盘拉取最新状态。
+func pollStatus() (*protocol.Sample, deviceInfo, []string, error) {
+	resp, err := http.Get(fmt.Sprintf("http://localhost:%d/api/status", gWebPort))
+	if err != nil {
+		return nil, deviceInfo{}, nil, err
+	}
+	defer resp.Body.Close()
+	var sr statusResp
+	if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
+		return nil, deviceInfo{}, nil, err
+	}
+	if sr.Sample == nil {
+		return nil, sr.Device, sr.Events, fmt.Errorf("设备未就绪: %s", sr.Error)
+	}
+	return viewerSample(*sr.Sample), sr.Device, sr.Events, nil
+}
+
+// viewerSample 将 Web 接口返回的 JSON 样本映射回 protocol.Sample，供控制台面板渲染。
+func viewerSample(sj sampleJSON) *protocol.Sample {
+	s := &protocol.Sample{
+		Time:           parseTimeSafe(sj.Time),
+		Online:         sj.Online,
+		Charging:       sj.Charging,
+		Status:         sj.Status,
+		InputVoltage1:  sj.InputVoltage,
+		InputVoltage:   sj.InputVoltage,
+		OutputVoltage:  sj.OutputVoltage,
+		BatteryVoltage: sj.BatteryVoltage,
+		InputCurrent:   sj.InputCurrent,
+		ChargeCurrent:  sj.ChargeCurrent,
+		LoadPercent:    sj.LoadPercent,
+		LoadValid:      sj.LoadValid,
+		ChargePercent:  sj.ChargePercent,
+		RuntimeSec:     sj.RuntimeSec,
+	}
+	// OB 模式下 InputCurrent 即电池放电电流，供续航估算复用
+	s.BatteryCurrent = sj.InputCurrent
+	for i := 0; i < len(sj.Cells) && i < len(s.Cells); i++ {
+		s.Cells[i] = sj.Cells[i]
+	}
+	switch sj.StatusCode {
+	case "OL":
+		s.Mode, s.RawStatus = protocol.ModeOnline, vStatusOL
+	case "OL CHRG":
+		s.Mode, s.RawStatus = protocol.ModeOnline, vStatusOLCHRG
+	case "OB":
+		s.Mode, s.RawStatus = protocol.ModeBattery, vStatusOB
+	default:
+		s.Mode = protocol.ModeUnknown
+	}
+	return s
+}
+
+func parseTimeSafe(t string) time.Time {
+	if t == "" {
+		return time.Now()
+	}
+	if parsed, err := time.Parse(time.RFC3339, t); err == nil {
+		return parsed
+	}
+	return time.Now()
 }

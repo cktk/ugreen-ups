@@ -22,6 +22,12 @@ import (
 //go:embed assets/dashboard.html
 var dashboardFS embed.FS
 
+// gDashboardURL 与 gWebPort 记录 Web 仪表盘的实际地址，供托盘菜单“打开界面”使用。
+var (
+	gDashboardURL = "http://localhost:8080/"
+	gWebPort      = 8080
+)
+
 // ---------------------------------------------------------------- 采集器
 
 type historyPoint struct {
@@ -55,18 +61,26 @@ type monitor struct {
 }
 
 func newMonitor(dev *hid.Device) *monitor {
-	return &monitor{
-		dev: dev,
-		info: deviceInfo{
+	m := &monitor{
+		dev:      dev,
+		interval: time.Duration(*fInterval) * time.Millisecond,
+	}
+	if dev != nil {
+		m.info = deviceInfo{
 			Manufacturer: dev.Manufacturer,
 			Product:      dev.Product,
 			Serial:       dev.Serial,
 			VendorID:     fmt.Sprintf("%04X", dev.VendorID),
 			ProductID:    fmt.Sprintf("%04X", dev.ProductID),
 			Firmware:     fmt.Sprintf("%d.%02d", dev.Version>>8, dev.Version&0xFF),
-		},
-		interval: time.Duration(*fInterval) * time.Millisecond,
+		}
+	} else {
+		m.info = deviceInfo{
+			Manufacturer: "UGREEN", Product: "US3000",
+			Serial: "—", VendorID: "2B89", ProductID: "FFFF", Firmware: "—",
+		}
 	}
+	return m
 }
 
 func (m *monitor) loop() {
@@ -78,6 +92,15 @@ func (m *monitor) loop() {
 }
 
 func (m *monitor) readOnce() {
+	m.mu.Lock()
+	if m.dev == nil {
+		m.lastErr = "设备未连接，正在尝试重连…"
+		m.mu.Unlock()
+		m.tryReconnect()
+		return
+	}
+	m.mu.Unlock()
+
 	raw, err := m.dev.Read(3000)
 
 	m.mu.Lock()
@@ -153,6 +176,31 @@ func (m *monitor) readOnce() {
 	}
 }
 
+// tryReconnect 在设备未连接时尝试重新打开 UPS；成功则更新设备信息。
+func (m *monitor) tryReconnect() {
+	m.mu.Lock()
+	if m.dev != nil {
+		m.mu.Unlock()
+		return
+	}
+	m.mu.Unlock()
+	if nd, e := openUPS(); e == nil {
+		m.mu.Lock()
+		m.dev = nd
+		m.info = deviceInfo{
+			Manufacturer: nd.Manufacturer,
+			Product:      nd.Product,
+			Serial:       nd.Serial,
+			VendorID:     fmt.Sprintf("%04X", nd.VendorID),
+			ProductID:    fmt.Sprintf("%04X", nd.ProductID),
+			Firmware:     fmt.Sprintf("%d.%02d", nd.Version>>8, nd.Version&0xFF),
+		}
+		m.lastErr = ""
+		m.addEvent("设备已重新连接")
+		m.mu.Unlock()
+	}
+}
+
 func (m *monitor) addEvent(msg string) {
 	m.events = append(m.events, time.Now().Format("15:04:05")+" "+msg)
 	if len(m.events) > 20 {
@@ -162,12 +210,12 @@ func (m *monitor) addEvent(msg string) {
 
 // ---------------------------------------------------------------- HTTP 服务
 
-func runWeb(addr string) {
-	dev, err := openUPS()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s连接 UPS 失败: %v%s\n", cRed, err, cReset)
-		fmt.Fprintf(os.Stderr, "请确认 UPS 已通过 USB 连接，或运行 -list 查看设备。\n")
-		os.Exit(1)
+func runWeb(addr string, noBrowser bool) {
+	var dev *hid.Device
+	if d, err := openUPS(); err != nil {
+		fmt.Fprintf(os.Stderr, "%sUPS 未连接: %v%s（继续启动服务，连接后自动恢复）\n", cYellow, err, cReset)
+	} else {
+		dev = d
 	}
 
 	m := newMonitor(dev)
@@ -198,13 +246,15 @@ func runWeb(addr string) {
 	}
 
 	url := fmt.Sprintf("http://localhost:%d/", portOf(ln.Addr()))
+	gWebPort = portOf(ln.Addr())
+	gDashboardURL = url
 	fmt.Printf("%s UGREEN US3000 UPS 仪表盘已启动 %s\n", cBold+cGreen, cReset)
 	fmt.Printf("  设备:   %s %s (序列号 %s, 固件 %s)\n",
-		dev.Manufacturer, dev.Product, dev.Serial, m.info.Firmware)
+		m.info.Manufacturer, m.info.Product, m.info.Serial, m.info.Firmware)
 	fmt.Printf("  地址:   %s%s%s\n", cCyan, url, cReset)
 	fmt.Printf("  %s按 Ctrl+C 停止服务%s\n\n", cDim, cReset)
 
-	if !*fNoBrowser {
+	if !noBrowser {
 		go func() {
 			time.Sleep(400 * time.Millisecond)
 			openBrowser(url)
